@@ -56,6 +56,10 @@ exactly hidden_states.shape and includes expert computation and weighted combine
 expert_indices always remain in [0,E). Dropped routes have zero weights;
 surviving routes are renormalized. See the full document before integration.
 
+Latest MQA low-precision results and kernel details: docs/mqa_low_precision_tuning.txt.
+
+Latest MoE low-precision expert results: docs/moe_low_precision_tuning.txt.
+
 Representative-shape follow-up: see docs/operator_shape_coverage.txt.
 MQA/Swin/Adaptive/MoE now each use 20 selected parameter sets. The original
 small-shape performance snapshot below predates that selection; GQA is unchanged.

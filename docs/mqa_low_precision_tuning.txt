@@ -1,0 +1,97 @@
+MQA low-precision tuning and common-kernel refactoring
+====================================================
+
+Scope: MQA implementation/tests and its documentation only. GQA, Swin,
+Adaptive, MoE, registrations, and all benchmark shapes are unchanged.
+The public interface, bool True=visible masks, additive float masks,
+output dtype, scale handling, and numerical tolerances are preserved.
+
+Implementation and code organization
+------------------------------------
+The optimized implementation initially grew to 897 lines. The final file
+has 612 lines (285 fewer, 31.8% reduction), including validation and launch
+policies. The published version before this tuning had 636 lines.
+
+1. A shared inline tile helper computes QK, masking, online FP32 softmax,
+   and PV. It is compiled into the forward kernel and launches no kernel.
+2. One forward kernel supports per-head rows and packed head/token rows.
+   PACK_HEADS is a compile-time flag, so unused mapping code is removed.
+   Packing uses the single shared KV head across many query heads and
+   avoids padding each single-token query to a full query tile.
+3. One merge kernel supports both row-wise and element-wise reduction.
+   The row-wise variant reuses each split normalizer across channels.
+4. One host launcher selects tiles, allocates temporary buffers when
+   necessary, and launches the shared forward/merge entry points.
+5. Preserve int32 tile offsets on the per-head path while using int64
+   batch bases. Flattening every address into an int64 row index changed
+   code generation and caused repeatable regressions during refactoring.
+
+Compile-time specialization retains tile sizes, KV splitting, alignment
+checks, mask handling, and short-query mappings selected by the tuning.
+There are two launchable Triton entry points. An unsplit call launches
+one fused QK/softmax/PV kernel; a split call launches it plus one merge.
+The inline helper is code reuse, rather than an extra runtime operation.
+
+Low-precision matrix operands retain FP16/BF16; softmax state and
+accumulation use FP32. FP32 products request input_precision="ieee".
+Standard tl.range software pipelining is used. Sampled direct TLE pipeline
+experiments did not materially improve it, so no TLE dependency is added.
+No TF32 approximation or relaxed accuracy threshold is introduced.
+
+Validation and measurement
+--------------------------
+169 MQA correctness tests passed, including noncontiguous strides,
+query/KV tails, head dimensions 7/256, custom scale, empty split ranges,
+and forced single/multiple KV partitions.
+All 120 benchmark comparisons passed: unchanged 20 representative shapes
+x FP16/BF16/FP32 x unmasked/masked. All 80 masked or FP32 comparisons
+between the 897-line and 612-line versions were bitwise identical.
+Tolerances (absolute and relative): FP16 0.002, BF16 0.015, FP32 2e-5.
+
+Platform: PPU-ZW810E; PPU_FP32_TENSOR_OVERRIDE=0. Each phase measured
+before/after/native on identical tensors in one process, with
+ triton.testing.do_bench(warmup=10, rep=50, return_mode="median").
+The first phase compared the published 636-line version at commit
+43c8d4fc3d8286143a43da645e2061b36392e5eb with the optimized 897-line version.
+The second phase compared 897 lines against the final 612 lines.
+The published and final timings therefore come from separate phases;
+per-shape raw timings and refactor ratios accompany the validation bundle.
+
+Geometric mean native_latency / implementation_latency over 20 shapes:
+Scenario, dtype: published -> optimized897 -> compact612; refactor ratio
+no mask, torch.float16: 0.539x -> 1.329x -> 1.330x; 1.0012x
+no mask, torch.bfloat16: 0.539x -> 1.325x -> 1.329x; 1.0034x
+no mask, torch.float32: 1.170x -> 1.174x -> 1.179x; 1.0046x
+masked, torch.float16: 3.355x -> 3.351x -> 3.353x; 1.0005x
+masked, torch.bfloat16: 3.388x -> 3.383x -> 3.384x; 1.0002x
+masked, torch.float32: 1.041x -> 1.042x -> 1.043x; 1.0013x
+
+Selected final FP16 no-mask latencies (milliseconds):
+case  8 [1, 32, 1, 1, 2048, 128]: optimized897=0.009360, compact612=0.009600, native=0.023280
+case  9 [1, 32, 1, 1, 8192, 128]: optimized897=0.015720, compact612=0.015680, native=0.037840
+case 10 [8, 32, 1, 1, 8192, 128]: optimized897=0.058120, compact612=0.058160, native=0.092160
+case 11 [32, 32, 1, 1, 32768, 128]: optimized897=0.528680, compact612=0.527680, native=1.106940
+case 12 [1, 71, 1, 1, 8192, 64]: optimized897=0.014760, compact612=0.014800, native=0.035440
+case 13 [8, 71, 1, 16, 32768, 64]: optimized897=1.733720, compact612=1.775680, native=8.244440
+case 14 [1, 32, 1, 128, 8192, 128]: optimized897=0.271480, compact612=0.271960, native=0.546280
+case 15 [1, 32, 1, 512, 32768, 128]: optimized897=4.412360, compact612=4.212720, native=3.816160
+case 16 [1, 32, 1, 2048, 2048, 128]: optimized897=0.946480, compact612=0.937100, native=0.802560
+case 18 [1, 32, 1, 8192, 8192, 128]: optimized897=13.220720, compact612=13.216080, native=11.201660
+case 19 [1, 64, 1, 4096, 4096, 128]: optimized897=6.695720, compact612=6.704960, native=5.708440
+
+Final profiler cross-check, FP16 [32,32,1,128] query and 32768 KV tokens:
+before: multi_query_attention_fwd_kernel, 3 calls, average 26674.849 us
+compact612: multi_query_attention_fwd_kernel, 3 calls, average 503.239 us
+compact612: multi_query_attention_split_kv_merge_kernel, 3 calls, average 5.613 us
+
+Remaining limits
+----------------
+Geometric means and small measurement fluctuations do not imply every
+shape is equally fast. Some large prefill and 64/256-channel cases remain
+slower than the native reference. MetaX and other platforms still need
+their own numerical/performance validation and launch-policy tuning.
+
+Reproduce
+---------
+PPU_FP32_TENSOR_OVERRIDE=0 PYTHONPATH=src pytest -q tests/test_multi_query_attention.py
+PPU_FP32_TENSOR_OVERRIDE=0 PYTHONPATH=src pytest -q -s benchmark/test_multi_query_attention.py --level core --warmup 10 --iter 50 --record json --output mqa_tuned.json

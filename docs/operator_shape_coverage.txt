@@ -152,11 +152,17 @@ six regressions with expert strides above 2**31 elements. Swin passed 122 cases.
 
 Geometric mean speedups, 20 parameter sets per row (native / FlagGems):
 adaptive_attention_span [native]: FP16 15.332x; BF16 15.350x; FP32 6.048x
-moe_gate_top_k_routing [grouped]: FP16 1.337x; BF16 1.290x; FP32 2.157x
-moe_gate_top_k_routing [padded]: FP16 1.009x; BF16 1.012x; FP32 2.040x
-multi_query_attention_mqa [native]: FP16 0.539x; BF16 0.538x; FP32 1.174x
-multi_query_attention_mqa_mask [native]: FP16 3.347x; BF16 3.367x; FP32 1.043x
+moe_gate_top_k_routing [grouped]: FP16 2.717x; BF16 2.539x; FP32 2.207x
+moe_gate_top_k_routing [padded]: FP16 2.113x; BF16 1.996x; FP32 2.044x
+multi_query_attention_mqa [native]: FP16 1.330x; BF16 1.329x; FP32 1.179x
+multi_query_attention_mqa_mask [native]: FP16 3.353x; BF16 3.384x; FP32 1.043x
 swin_transformer_attention [native]: FP16 3.081x; BF16 3.116x; FP32 1.589x
+
+MQA and MoE rows were updated by subsequent paired tuning runs;
+Swin and Adaptive rows retain the original representative-20 measurements.
+See docs/mqa_low_precision_tuning.txt and docs/moe_low_precision_tuning.txt.
+
+Latest MoE paired timings and regular-FFN subset: docs/moe_low_precision_tuning.txt.
 
 These are PPU measurements against the stated PyTorch implementations, not
 optimized serving-engine or MetaX results. The MoE aggregate mixes expert

@@ -104,46 +104,38 @@ def _validate_inputs(query, key, value, attn_mask, scale, num_query_heads):
 
 
 @triton.jit
-def _multi_query_attention_forward_tile(
-    K,
-    V,
-    AttnMask,
-    softmax_scale,
-    stride_k_head: tl.constexpr,
-    stride_k_seq: tl.constexpr,
-    stride_k_dim: tl.constexpr,
-    stride_v_head: tl.constexpr,
-    stride_v_seq: tl.constexpr,
-    stride_v_dim: tl.constexpr,
-    mask_strides: tl.constexpr,
-    MASK_BATCH: tl.constexpr,
-    QUERY_LEN: tl.constexpr,
-    KEY_LEN: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    HAS_MASK: tl.constexpr,
-    MASK_IS_BOOL: tl.constexpr,
-    QUERY_LEN_ALIGNED: tl.constexpr,
-    KEY_TILE_ALIGNED: tl.constexpr,
-    HEAD_DIM_ALIGNED: tl.constexpr,
+def _multi_query_attention_tile(
     query,
-    key_base,
-    value_base,
-    kv_head,
-    head_offsets,
-    query_offsets,
-    batch,
-    query_head,
-    row_max,
-    row_sum,
-    accumulator,
+    buffers,
+    bases,
+    offsets,
+    state,
     key_start,
+    softmax_scale,
+    STRIDES: tl.constexpr,
+    SHAPE: tl.constexpr,
+    FLAGS: tl.constexpr,
+    KEY_TILE_ALIGNED: tl.constexpr,
 ):
+    """Inline the QK/mask/softmax/PV update for a single KV tile."""
+    K, V, AttnMask = buffers
+    key_base, value_base, mask_base = bases
+    query_offsets, head_offsets = offsets
+    row_max, row_sum, accumulator = state
+    (
+        stride_k_seq,
+        stride_k_dim,
+        stride_v_seq,
+        stride_v_dim,
+        stride_mask_q,
+        stride_mask_k,
+    ) = STRIDES
+    ROW_COUNT, KEY_LEN, HEAD_DIM, BLOCK_N = SHAPE
+    HAS_MASK, MASK_IS_BOOL, ROWS_ALIGNED, HEAD_DIM_ALIGNED = FLAGS
     key_offsets = key_start + tl.arange(0, BLOCK_N)
     key = tl.load(
         K
         + key_base
-        + kv_head * stride_k_head
         + head_offsets[:, None] * stride_k_dim
         + key_offsets[None, :] * stride_k_seq,
         ((head_offsets[:, None] < HEAD_DIM) | HEAD_DIM_ALIGNED)
@@ -151,24 +143,23 @@ def _multi_query_attention_forward_tile(
         other=0,
     )
     scores = tl.dot(query, key, input_precision="ieee") * softmax_scale
-    score_is_valid = ((query_offsets[:, None] < QUERY_LEN) | QUERY_LEN_ALIGNED) & (
+    valid = ((query_offsets[:, None] < ROW_COUNT) | ROWS_ALIGNED) & (
         (key_offsets[None, :] < KEY_LEN) | KEY_TILE_ALIGNED
     )
     if HAS_MASK:
-        attn_mask = tl.load(
+        mask = tl.load(
             AttnMask
-            + batch % MASK_BATCH * mask_strides[0]
-            + query_head * mask_strides[1]
-            + query_offsets[:, None] * mask_strides[2]
-            + key_offsets[None, :] * mask_strides[3],
-            score_is_valid,
+            + mask_base
+            + query_offsets[:, None] * stride_mask_q
+            + key_offsets[None, :] * stride_mask_k,
+            valid,
             other=0,
         )
         if MASK_IS_BOOL:
-            score_is_valid = score_is_valid & attn_mask
+            valid = valid & mask
         else:
-            scores += attn_mask.to(tl.float32) * 1.4426950408889634
-    scores = tl.where(score_is_valid, scores, -float("inf"))
+            scores += mask.to(tl.float32) * 1.4426950408889634
+    scores = tl.where(valid, scores, -float("inf"))
     new_max = tl.maximum(row_max, tl.max(scores, 1))
     safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
     probabilities = tl.exp2(scores - safe_max[:, None])
@@ -177,19 +168,19 @@ def _multi_query_attention_forward_tile(
     value = tl.load(
         V
         + value_base
-        + kv_head * stride_v_head
         + key_offsets[:, None] * stride_v_seq
         + head_offsets[None, :] * stride_v_dim,
         ((key_offsets[:, None] < KEY_LEN) | KEY_TILE_ALIGNED)
         & ((head_offsets[None, :] < HEAD_DIM) | HEAD_DIM_ALIGNED),
         other=0,
     )
-    accumulator = accumulator * alpha[:, None]
     accumulator = tl.dot(
-        probabilities.to(value.dtype), value, accumulator, input_precision="ieee"
+        probabilities.to(value.dtype),
+        value,
+        accumulator * alpha[:, None],
+        input_precision="ieee",
     )
-    row_max = new_max
-    return (row_max, row_sum, accumulator)
+    return new_max, row_sum, accumulator
 
 
 @libentry()
@@ -202,27 +193,12 @@ def multi_query_attention_fwd_kernel(
     Out,
     LogSumExp,
     softmax_scale,
-    batch_strides_q: tl.constexpr,
-    batch_strides_k: tl.constexpr,
-    batch_strides_v: tl.constexpr,
-    BATCH_SHAPE: tl.constexpr,
-    stride_q_head: tl.constexpr,
-    stride_q_seq: tl.constexpr,
-    stride_q_dim: tl.constexpr,
-    stride_k_head: tl.constexpr,
-    stride_k_seq: tl.constexpr,
-    stride_k_dim: tl.constexpr,
-    stride_v_head: tl.constexpr,
-    stride_v_seq: tl.constexpr,
-    stride_v_dim: tl.constexpr,
-    stride_o_batch: tl.constexpr,
-    stride_o_head: tl.constexpr,
-    stride_o_seq: tl.constexpr,
-    stride_o_dim: tl.constexpr,
-    mask_strides: tl.constexpr,
+    Q_STRIDES: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    MASK_STRIDES: tl.constexpr,
     MASK_BATCH: tl.constexpr,
     BATCH_SIZE: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
     QUERY_HEADS: tl.constexpr,
     QUERY_LEN: tl.constexpr,
     KEY_LEN: tl.constexpr,
@@ -230,189 +206,137 @@ def multi_query_attention_fwd_kernel(
     HEAD_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    PIPELINE_NS: tl.constexpr,
     HAS_MASK: tl.constexpr,
     MASK_IS_BOOL: tl.constexpr,
-    QUERY_LEN_ALIGNED: tl.constexpr,
-    KEY_LEN_ALIGNED: tl.constexpr,
-    HEAD_DIM_ALIGNED: tl.constexpr,
-    PIPELINE_NS: tl.constexpr,
+    PACK_HEADS: tl.constexpr,
 ):
-    query_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    batch_head = tl.program_id(1)
-    batch, query_head = (batch_head // QUERY_HEADS, batch_head % QUERY_HEADS)
-    kv_head = 0
-    batch_index = batch
-    query_base = tl.full((), 0, tl.int64)
-    key_base = tl.full((), 0, tl.int64)
-    value_base = tl.full((), 0, tl.int64)
-    for batch_axis in tl.static_range(len(BATCH_SHAPE) - 1, -1, -1):
-        batch_coord = batch_index % BATCH_SHAPE[batch_axis]
-        batch_index = batch_index // BATCH_SHAPE[batch_axis]
-        query_base += batch_coord.to(tl.int64) * batch_strides_q[batch_axis]
-        key_base += batch_coord.to(tl.int64) * batch_strides_k[batch_axis]
-        value_base += batch_coord.to(tl.int64) * batch_strides_v[batch_axis]
-    head_offsets = tl.arange(0, HEAD_BLOCK)
+    ROW_COUNT: tl.constexpr = QUERY_HEADS * QUERY_LEN if PACK_HEADS else QUERY_LEN
+    ROWS_ALIGNED: tl.constexpr = ROW_COUNT % BLOCK_M == 0
+    KEY_LEN_ALIGNED: tl.constexpr = KEY_LEN % BLOCK_N == 0
+    HEAD_DIM_ALIGNED: tl.constexpr = HEAD_DIM == HEAD_BLOCK
+    if PACK_HEADS:
+        batch = tl.program_id(1).to(tl.int64)
+        batch_coord = batch
+        query_head = 0
+        query_offsets = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+        head_offsets = tl.arange(0, HEAD_BLOCK).to(tl.int64)
+        if Q_STRIDES[1] == QUERY_LEN * Q_STRIDES[2]:
+            query_rows = query_offsets * Q_STRIDES[2]
+        else:
+            query_rows = (
+                query_offsets // QUERY_LEN * Q_STRIDES[1]
+                + query_offsets % QUERY_LEN * Q_STRIDES[2]
+            )
+        query_base = batch * Q_STRIDES[0]
+    else:
+        batch_head = tl.program_id(1)
+        batch, query_head = batch_head // QUERY_HEADS, batch_head % QUERY_HEADS
+        batch_coord = batch % BATCH_SIZE
+        query_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        head_offsets = tl.arange(0, HEAD_BLOCK)
+        query_base = batch_coord.to(tl.int64) * Q_STRIDES[0]
+        query_rows = query_offsets * Q_STRIDES[2]
     query = tl.load(
         Q
         + query_base
-        + query_head * stride_q_head
-        + query_offsets[:, None] * stride_q_seq
-        + head_offsets[None, :] * stride_q_dim,
-        ((query_offsets[:, None] < QUERY_LEN) | QUERY_LEN_ALIGNED)
+        + query_head * Q_STRIDES[1]
+        + query_rows[:, None]
+        + head_offsets[None, :] * Q_STRIDES[3],
+        ((query_offsets[:, None] < ROW_COUNT) | ROWS_ALIGNED)
         & ((head_offsets[None, :] < HEAD_DIM) | HEAD_DIM_ALIGNED),
         other=0,
     )
+    key_base, value_base = (
+        batch_coord.to(tl.int64) * K_STRIDES[0],
+        batch_coord.to(tl.int64) * V_STRIDES[0],
+    )
+    mask_base = tl.full((), 0, tl.int64)
+    if HAS_MASK:
+        mask_base = batch % MASK_BATCH * MASK_STRIDES[0] + query_head * MASK_STRIDES[1]
     row_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     row_sum = tl.zeros((BLOCK_M,), tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_BLOCK), tl.float32)
-    key_end_index = KEY_LEN
-    key_start_index = 0
-    if NUM_SPLITS > 1:
+    key_begin, key_end = 0, KEY_LEN
+    split = tl.program_id(2)
+    if PACK_HEADS:
+        split = split.to(tl.int64)
+    if PACK_HEADS or NUM_SPLITS > 1:
         keys_per_split = tl.cdiv(KEY_LEN, NUM_SPLITS * BLOCK_N) * BLOCK_N
-        key_start_index = tl.program_id(2) * keys_per_split
-        key_end_index = tl.minimum(key_start_index + keys_per_split, KEY_LEN)
-    # Specialize full KV tiles separately from the masked tail for small heads.
+        key_begin = split * keys_per_split
+        key_end = tl.minimum(key_begin + keys_per_split, KEY_LEN)
+    buffers = (K, V, AttnMask)
+    bases = (key_base, value_base, mask_base)
+    offsets = (query_offsets, head_offsets)
+    tile_strides: tl.constexpr = (
+        K_STRIDES[2],
+        K_STRIDES[3],
+        V_STRIDES[2],
+        V_STRIDES[3],
+        MASK_STRIDES[2],
+        MASK_STRIDES[3],
+    )
+    tile_shape: tl.constexpr = (ROW_COUNT, KEY_LEN, HEAD_DIM, BLOCK_N)
+    tile_flags: tl.constexpr = (HAS_MASK, MASK_IS_BOOL, ROWS_ALIGNED, HEAD_DIM_ALIGNED)
     if (
-        not HAS_MASK
+        not PACK_HEADS
+        and not HAS_MASK
         and Q.dtype.element_ty != tl.float32
-        and (HEAD_DIM <= 16)
-        and (not KEY_LEN_ALIGNED)
-        and (NUM_SPLITS == 1)
+        and HEAD_DIM <= 16
+        and not KEY_LEN_ALIGNED
+        and NUM_SPLITS == 1
     ):
         for key_start in tl.range(
             0, KEY_LEN // BLOCK_N * BLOCK_N, BLOCK_N, num_stages=PIPELINE_NS
         ):
-            row_max, row_sum, accumulator = _multi_query_attention_forward_tile(
-                K=K,
-                V=V,
-                AttnMask=AttnMask,
-                softmax_scale=softmax_scale,
-                stride_k_head=stride_k_head,
-                stride_k_seq=stride_k_seq,
-                stride_k_dim=stride_k_dim,
-                stride_v_head=stride_v_head,
-                stride_v_seq=stride_v_seq,
-                stride_v_dim=stride_v_dim,
-                mask_strides=mask_strides,
-                MASK_BATCH=MASK_BATCH,
-                QUERY_LEN=QUERY_LEN,
-                KEY_LEN=KEY_LEN,
-                HEAD_DIM=HEAD_DIM,
-                BLOCK_N=BLOCK_N,
-                HAS_MASK=HAS_MASK,
-                MASK_IS_BOOL=MASK_IS_BOOL,
-                QUERY_LEN_ALIGNED=QUERY_LEN_ALIGNED,
-                KEY_TILE_ALIGNED=True,
-                HEAD_DIM_ALIGNED=HEAD_DIM_ALIGNED,
-                query=query,
-                key_base=key_base,
-                value_base=value_base,
-                kv_head=kv_head,
-                head_offsets=head_offsets,
-                query_offsets=query_offsets,
-                batch=batch,
-                query_head=query_head,
-                row_max=row_max,
-                row_sum=row_sum,
-                accumulator=accumulator,
-                key_start=key_start,
+            row_max, row_sum, accumulator = _multi_query_attention_tile(
+                query,
+                buffers,
+                bases,
+                offsets,
+                (row_max, row_sum, accumulator),
+                key_start,
+                softmax_scale,
+                tile_strides,
+                tile_shape,
+                tile_flags,
+                True,
             )
         for key_start in tl.range(
             KEY_LEN // BLOCK_N * BLOCK_N, KEY_LEN, BLOCK_N, num_stages=1
         ):
-            row_max, row_sum, accumulator = _multi_query_attention_forward_tile(
-                K=K,
-                V=V,
-                AttnMask=AttnMask,
-                softmax_scale=softmax_scale,
-                stride_k_head=stride_k_head,
-                stride_k_seq=stride_k_seq,
-                stride_k_dim=stride_k_dim,
-                stride_v_head=stride_v_head,
-                stride_v_seq=stride_v_seq,
-                stride_v_dim=stride_v_dim,
-                mask_strides=mask_strides,
-                MASK_BATCH=MASK_BATCH,
-                QUERY_LEN=QUERY_LEN,
-                KEY_LEN=KEY_LEN,
-                HEAD_DIM=HEAD_DIM,
-                BLOCK_N=BLOCK_N,
-                HAS_MASK=HAS_MASK,
-                MASK_IS_BOOL=MASK_IS_BOOL,
-                QUERY_LEN_ALIGNED=QUERY_LEN_ALIGNED,
-                KEY_TILE_ALIGNED=False,
-                HEAD_DIM_ALIGNED=HEAD_DIM_ALIGNED,
-                query=query,
-                key_base=key_base,
-                value_base=value_base,
-                kv_head=kv_head,
-                head_offsets=head_offsets,
-                query_offsets=query_offsets,
-                batch=batch,
-                query_head=query_head,
-                row_max=row_max,
-                row_sum=row_sum,
-                accumulator=accumulator,
-                key_start=key_start,
+            row_max, row_sum, accumulator = _multi_query_attention_tile(
+                query,
+                buffers,
+                bases,
+                offsets,
+                (row_max, row_sum, accumulator),
+                key_start,
+                softmax_scale,
+                tile_strides,
+                tile_shape,
+                tile_flags,
+                False,
             )
     else:
-        for key_start in tl.range(
-            key_start_index, key_end_index, BLOCK_N, num_stages=PIPELINE_NS
-        ):
-            key_offsets = key_start + tl.arange(0, BLOCK_N)
-            key = tl.load(
-                K
-                + key_base
-                + kv_head * stride_k_head
-                + head_offsets[:, None] * stride_k_dim
-                + key_offsets[None, :] * stride_k_seq,
-                ((head_offsets[:, None] < HEAD_DIM) | HEAD_DIM_ALIGNED)
-                & ((key_offsets[None, :] < KEY_LEN) | KEY_LEN_ALIGNED),
-                other=0,
+        for key_start in tl.range(key_begin, key_end, BLOCK_N, num_stages=PIPELINE_NS):
+            row_max, row_sum, accumulator = _multi_query_attention_tile(
+                query,
+                buffers,
+                bases,
+                offsets,
+                (row_max, row_sum, accumulator),
+                key_start,
+                softmax_scale,
+                tile_strides,
+                tile_shape,
+                tile_flags,
+                KEY_LEN_ALIGNED,
             )
-            scores = tl.dot(query, key, input_precision="ieee") * softmax_scale
-            score_is_valid = (
-                (query_offsets[:, None] < QUERY_LEN) | QUERY_LEN_ALIGNED
-            ) & ((key_offsets[None, :] < KEY_LEN) | KEY_LEN_ALIGNED)
-            if HAS_MASK:
-                attn_mask = tl.load(
-                    AttnMask
-                    + batch % MASK_BATCH * mask_strides[0]
-                    + query_head * mask_strides[1]
-                    + query_offsets[:, None] * mask_strides[2]
-                    + key_offsets[None, :] * mask_strides[3],
-                    score_is_valid,
-                    other=0,
-                )
-                if MASK_IS_BOOL:
-                    score_is_valid = score_is_valid & attn_mask
-                else:
-                    scores += attn_mask.to(tl.float32) * 1.4426950408889634
-            scores = tl.where(score_is_valid, scores, -float("inf"))
-            new_max = tl.maximum(row_max, tl.max(scores, 1))
-            safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
-            probabilities = tl.exp2(scores - safe_max[:, None])
-            alpha = tl.exp2(row_max - safe_max)
-            row_sum = row_sum * alpha + tl.sum(probabilities, 1)
-            value = tl.load(
-                V
-                + value_base
-                + kv_head * stride_v_head
-                + key_offsets[:, None] * stride_v_seq
-                + head_offsets[None, :] * stride_v_dim,
-                ((key_offsets[:, None] < KEY_LEN) | KEY_LEN_ALIGNED)
-                & ((head_offsets[None, :] < HEAD_DIM) | HEAD_DIM_ALIGNED),
-                other=0,
-            )
-            accumulator = accumulator * alpha[:, None]
-            accumulator = tl.dot(
-                probabilities.to(value.dtype),
-                value,
-                accumulator,
-                input_precision="ieee",
-            )
-            row_max = new_max
-    output = accumulator / tl.where(row_sum > 0, row_sum, 1.0)[:, None]
+    # Keep tile offsets in int32 on the per-head path; flattening them to
+    # int64 changes code generation and slows several small-head shapes.
+    result = accumulator / tl.where(row_sum > 0, row_sum, 1.0)[:, None]
     tl.store(
         Out
         + tl.program_id(2).to(tl.int64)
@@ -420,12 +344,12 @@ def multi_query_attention_fwd_kernel(
         * QUERY_HEADS
         * QUERY_LEN
         * HEAD_DIM
-        + batch.to(tl.int64) * stride_o_batch
-        + query_head * stride_o_head
-        + query_offsets[:, None] * stride_o_seq
-        + head_offsets[None, :] * stride_o_dim,
-        output,
-        ((query_offsets[:, None] < QUERY_LEN) | QUERY_LEN_ALIGNED)
+        + batch.to(tl.int64) * QUERY_HEADS * QUERY_LEN * HEAD_DIM
+        + query_head * QUERY_LEN * HEAD_DIM
+        + query_offsets[:, None] * HEAD_DIM
+        + head_offsets[None, :],
+        result,
+        ((query_offsets[:, None] < ROW_COUNT) | ROWS_ALIGNED)
         & ((head_offsets[None, :] < HEAD_DIM) | HEAD_DIM_ALIGNED),
     )
     if NUM_SPLITS > 1:
@@ -435,7 +359,7 @@ def multi_query_attention_fwd_kernel(
             + (batch * QUERY_HEADS + query_head).to(tl.int64) * QUERY_LEN
             + query_offsets,
             row_max + tl.log2(row_sum),
-            query_offsets < QUERY_LEN,
+            query_offsets < ROW_COUNT,
         )
 
 
@@ -449,28 +373,67 @@ def multi_query_attention_split_kv_merge_kernel(
     HEAD_DIM: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ROW_WISE: tl.constexpr,
 ):
-    output_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     split_offsets = tl.arange(0, NUM_SPLITS)
-    row_offsets = output_offsets // HEAD_DIM
-    log_normalizers = tl.load(
-        LogSumExp + split_offsets[:, None] * (NUMEL // HEAD_DIM) + row_offsets[None, :],
-        output_offsets[None, :] < NUMEL,
-        other=-float("inf"),
-    )
-    max_log_normalizer = tl.max(log_normalizers, axis=0)
-    safe_max = tl.where(max_log_normalizer == -float("inf"), 0.0, max_log_normalizer)
-    merge_weights = tl.exp2(log_normalizers - safe_max[None, :])
-    partial_outputs = tl.load(
+    if ROW_WISE:
+        split_offsets = split_offsets.to(tl.int64)
+        row = tl.program_id(0).to(tl.int64)
+        channels = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+        output_offsets = row * HEAD_DIM + channels
+        output_mask = channels < HEAD_DIM
+        log_normalizers = tl.load(LogSumExp + split_offsets * (NUMEL // HEAD_DIM) + row)
+    else:
+        output_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        output_mask = output_offsets < NUMEL
+        log_normalizers = tl.load(
+            LogSumExp
+            + split_offsets[:, None] * (NUMEL // HEAD_DIM)
+            + output_offsets[None, :] // HEAD_DIM,
+            output_mask[None, :],
+            other=-float("inf"),
+        )
+    maximum = tl.max(log_normalizers, 0)
+    maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp2(log_normalizers - maximum)
+    denominator = tl.sum(weights, 0)
+    if ROW_WISE:
+        weights = weights[:, None]
+    values = tl.load(
         PartialOut + split_offsets[:, None] * NUMEL + output_offsets[None, :],
-        output_offsets[None, :] < NUMEL,
-        other=0.0,
+        output_mask[None, :],
+        other=0,
     )
-    normalizer = tl.sum(merge_weights, axis=0)
-    output = tl.sum(partial_outputs * merge_weights, axis=0) / tl.where(
-        normalizer > 0, normalizer, 1.0
-    )
-    tl.store(Out + output_offsets, output, output_offsets < NUMEL)
+    result = tl.sum(values * weights, 0) / tl.where(denominator > 0, denominator, 1.0)
+    tl.store(Out + output_offsets, result, output_mask)
+
+
+def _select_packed_tiling(batch_size, query_heads, query_len, key_len, head_dim):
+    """Tile the shared-KV query rows and expose enough KV work for short queries."""
+    if query_len <= 16:
+        if head_dim > 128:
+            block_m, block_n, pipeline_ns = 16, 32, 2
+        elif query_len > 1:
+            block_m, block_n, pipeline_ns = 64, 128, 2
+        elif key_len <= 2048 and batch_size == 1 and query_heads <= 32:
+            block_m, block_n, pipeline_ns = 16, 128, 2
+        elif batch_size >= 16 and key_len >= 16384:
+            block_m, block_n, pipeline_ns = 32, 128, 2
+        else:
+            block_m, block_n, pipeline_ns = 32, 64, 3
+    else:
+        block_m, block_n, pipeline_ns = 128, 64, 2
+    query_programs = batch_size * triton.cdiv(query_heads * query_len, block_m)
+    num_splits = 1
+    if query_programs < 128 and (query_len <= 16 or key_len >= 4 * query_len):
+        # Shorter KV partitions reduce the serial softmax dependency chain.
+        desired_splits = max(
+            triton.cdiv(128, query_programs), triton.cdiv(key_len, 2048)
+        )
+        key_tiles = triton.cdiv(key_len, block_n)
+        max_splits = min(32, 1 << (key_tiles.bit_length() - 1))
+        num_splits = min(max_splits, triton.next_power_of_2(desired_splits))
+    return block_m, block_n, num_splits, 4, pipeline_ns
 
 
 def _select_kv_splits(batch_size, query_heads, query_len, key_len, block_m):
@@ -533,41 +496,63 @@ def _select_gpu_tiling(
 def _launch_attention_forward(query, key, value, attn_mask=None, scale=None):
     batch_size, query_heads, query_len, head_dim = query.shape
     key_len = key.shape[2]
-    batch_shape = (batch_size,)
-    qkv_strides = [
-        ((tensor.stride(0),), *tensor.stride()[1:]) for tensor in (query, key, value)
-    ]
-    output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
-    output_strides = output.stride()
-    mask_strides, mask_batch = _resolve_mask_layout(
-        attn_mask, query, (batch_size, query_heads, query_len, key_len)
-    )
-    block_m, block_n, pipeline_ns, num_warps = _select_gpu_tiling(
-        query_len=query_len,
-        key_len=key_len,
-        head_dim=head_dim,
-        batch_size=batch_size,
-        query_heads=query_heads,
-        is_fp32=query.dtype == torch.float32,
-        has_mask=attn_mask is not None,
-    )
-    num_splits = _select_kv_splits(batch_size, query_heads, query_len, key_len, block_m)
-    partial_output = output
-    log_normalizers = query
+    pack_heads = False
+    if attn_mask is None and query.dtype in (torch.float16, torch.bfloat16):
+        pack_heads = (
+            (query_len <= 16 and key_len >= 512 and head_dim <= 256)
+            or (
+                head_dim == 128
+                and query_len >= 128
+                and key_len >= 1024
+                and key_len % 64 == 0
+            )
+            or (
+                head_dim == 32
+                and query_len >= 128
+                and key_len >= 8 * query_len
+                and batch_size * query_heads * triton.cdiv(query_len, 128) < 128
+            )
+        )
+    if pack_heads:
+        block_m, block_n, num_splits, num_warps, pipeline_ns = _select_packed_tiling(
+            batch_size, query_heads, query_len, key_len, head_dim
+        )
+        mask_strides, mask_batch = (0, 0, 0, 0), 1
+    else:
+        block_m, block_n, pipeline_ns, num_warps = _select_gpu_tiling(
+            query_len,
+            key_len,
+            head_dim,
+            batch_size,
+            query_heads,
+            query.dtype == torch.float32,
+            attn_mask is not None,
+        )
+        num_splits = _select_kv_splits(
+            batch_size, query_heads, query_len, key_len, block_m
+        )
+        mask_strides, mask_batch = _resolve_mask_layout(
+            attn_mask, query, (batch_size, query_heads, query_len, key_len)
+        )
+    output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+    partial_output, log_normalizers = output, query
     if num_splits > 1:
         partial_output = torch.empty(
             (num_splits, batch_size, query_heads, query_len, head_dim),
-            dtype=torch.float32,
             device=query.device,
+            dtype=torch.float32,
         )
         log_normalizers = torch.empty(
             (num_splits, batch_size, query_heads, query_len),
-            dtype=torch.float32,
             device=query.device,
+            dtype=torch.float32,
         )
+    head_block = max(16, triton.next_power_of_2(head_dim))
+    row_count = query_heads * query_len if pack_heads else query_len
+    batch_programs = batch_size if pack_heads else batch_size * query_heads
     with torch_device_fn.device(query.device):
         multi_query_attention_fwd_kernel[
-            triton.cdiv(query_len, block_m), batch_size * query_heads, num_splits
+            (triton.cdiv(row_count, block_m), batch_programs, num_splits)
         ](
             query,
             key,
@@ -576,53 +561,44 @@ def _launch_attention_forward(query, key, value, attn_mask=None, scale=None):
             partial_output,
             log_normalizers,
             _resolve_softmax_scale(scale, head_dim) * 1.4426950408889634,
-            batch_strides_q=qkv_strides[0][0],
-            batch_strides_k=qkv_strides[1][0],
-            batch_strides_v=qkv_strides[2][0],
-            BATCH_SHAPE=batch_shape,
-            stride_q_head=qkv_strides[0][1],
-            stride_q_seq=qkv_strides[0][2],
-            stride_q_dim=qkv_strides[0][3],
-            stride_k_head=qkv_strides[1][1],
-            stride_k_seq=qkv_strides[1][2],
-            stride_k_dim=qkv_strides[1][3],
-            stride_v_head=qkv_strides[2][1],
-            stride_v_seq=qkv_strides[2][2],
-            stride_v_dim=qkv_strides[2][3],
-            stride_o_batch=output_strides[0],
-            stride_o_head=output_strides[1],
-            stride_o_seq=output_strides[2],
-            stride_o_dim=output_strides[3],
-            mask_strides=mask_strides,
+            Q_STRIDES=query.stride(),
+            K_STRIDES=key.stride(),
+            V_STRIDES=value.stride(),
+            MASK_STRIDES=mask_strides,
             MASK_BATCH=mask_batch,
             BATCH_SIZE=batch_size,
-            NUM_SPLITS=num_splits,
             QUERY_HEADS=query_heads,
             QUERY_LEN=query_len,
             KEY_LEN=key_len,
             HEAD_DIM=head_dim,
-            HEAD_BLOCK=max(16, triton.next_power_of_2(head_dim)),
+            HEAD_BLOCK=head_block,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            NUM_SPLITS=num_splits,
+            PIPELINE_NS=pipeline_ns,
             HAS_MASK=attn_mask is not None,
             MASK_IS_BOOL=attn_mask is not None and attn_mask.dtype == torch.bool,
-            QUERY_LEN_ALIGNED=query_len % block_m == 0,
-            KEY_LEN_ALIGNED=key_len % block_n == 0,
-            HEAD_DIM_ALIGNED=head_dim == max(16, triton.next_power_of_2(head_dim)),
-            PIPELINE_NS=pipeline_ns,
+            PACK_HEADS=pack_heads,
             num_warps=num_warps,
             num_stages=pipeline_ns,
         )
         if num_splits > 1:
             numel = batch_size * query_heads * query_len * head_dim
-            multi_query_attention_split_kv_merge_kernel[triton.cdiv(numel, 256),](
+            block_size = head_block if pack_heads else 256
+            grid = (
+                batch_size * query_heads * query_len
+                if pack_heads
+                else triton.cdiv(numel, block_size)
+            )
+            multi_query_attention_split_kv_merge_kernel[(grid,)](
                 partial_output,
                 log_normalizers,
                 output,
                 NUMEL=numel,
                 HEAD_DIM=head_dim,
                 NUM_SPLITS=num_splits,
-                BLOCK_SIZE=256,
+                BLOCK_SIZE=block_size,
+                ROW_WISE=pack_heads,
                 num_warps=4,
             )
     return output

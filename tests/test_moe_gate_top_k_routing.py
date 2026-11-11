@@ -448,3 +448,35 @@ def test_moe_routes_from_returned_quantized_logits(dtype):
     )
     expected = _reference(hidden, gate, 4, 1.25, router_logits=actual[0], **kwargs)
     _assert_result(actual, expected, hidden, 60, 4)
+
+
+@pytest.mark.moe_gate_top_k_routing
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("activation", ("relu", "swiglu", "geglu"))
+@pytest.mark.parametrize("strided", (False, True))
+@pytest.mark.parametrize("tile", ((16, 64, 64, 3), (64, 128, 64, 3), (128, 64, 64, 3)))
+def test_moe_pipelined_expert_tiles(dtype, activation, strided, tile, monkeypatch):
+    import importlib
+
+    module = importlib.import_module("flag_gems.ops.moe_gate_top_k_routing")
+    monkeypatch.setattr(module, "_select_expert_tiling", lambda *args: tile)
+    torch.manual_seed(137)
+    hidden, gate, kwargs = _inputs((2, 17, 65), 5, 97, dtype, activation, strided)
+    if strided:
+        hidden = hidden.transpose(0, 1)
+        gate = gate.transpose(0, 1).contiguous().transpose(0, 1)
+    actual = flag_gems.moe_gate_top_k_routing(hidden, gate, 5, 3, 0.5, **kwargs)
+    _assert_result(actual, _reference(hidden, gate, 3, 0.5, **kwargs), hidden, 5, 3)
+
+
+@pytest.mark.moe_gate_top_k_routing
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("shape", ((129, 512), (3, 43, 512)))
+@pytest.mark.parametrize("activation", ("relu", "swiglu"))
+def test_moe_model_width_tiles(dtype, shape, activation):
+    torch.manual_seed(139)
+    hidden, gate, kwargs = _inputs(shape, 4, 640, dtype, activation)
+    # Exact ties exercise empty experts, capacity dropping and two input ranks.
+    gate.zero_()
+    actual = flag_gems.moe_gate_top_k_routing(hidden, gate, 4, 2, 1.25, **kwargs)
+    _assert_result(actual, _reference(hidden, gate, 2, 1.25, **kwargs), hidden, 4, 2)

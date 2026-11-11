@@ -165,3 +165,49 @@ def test_standard_mask_broadcast(dtype, mask_shape, boolean):
     actual = flag_gems.multi_query_attention_mqa(query, key, value, mask)
     expected = _reference(query, key, value, mask)
     _assert_close(actual, expected)
+
+
+@pytest.mark.multi_query_attention_mqa
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (1, 32, 1, 2048, 128),
+        (2, 71, 1, 1025, 64),
+        (2, 3, 16, 769, 33),
+        (1, 5, 129, 1024, 128),
+    ),
+)
+@pytest.mark.parametrize("noncontiguous", (False, True))
+@pytest.mark.parametrize("splits", (1, 16))
+def test_mqa_packed_heads_and_kv_splits(
+    dtype, shape, noncontiguous, splits, monkeypatch
+):
+    import importlib
+
+    module = importlib.import_module("flag_gems.ops.multi_query_attention")
+
+    def config(*args):
+        return 32, 64, splits, 4, 2
+
+    monkeypatch.setattr(module, "_select_packed_tiling", config)
+    b, h, lq, lk, d = shape
+    query, key, value = _make((b, h, 1, lq, lk, d), dtype, noncontiguous)
+    if noncontiguous:
+        query = torch.randn(b, lq, h, d * 2, device=query.device, dtype=dtype)[
+            ..., ::2
+        ].transpose(1, 2)
+    result = flag_gems.multi_query_attention_mqa(query, key, value, scale=0.17)
+    _assert_close(result, _reference(query, key, value, scale=0.17))
+
+
+@pytest.mark.multi_query_attention_mqa
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_dim", (7, 256))
+def test_mqa_packed_decode_head_dimensions(dtype, head_dim):
+    query, key, value = _make((2, 5, 1, 4, 769, head_dim), dtype, True)
+    query = torch.randn(2, 4, 5, head_dim * 2, device=query.device, dtype=dtype)[
+        ..., ::2
+    ].transpose(1, 2)
+    result = flag_gems.multi_query_attention_mqa(query, key, value)
+    _assert_close(result, _reference(query, key, value))

@@ -272,6 +272,7 @@ def moe_expert_up_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    PIPELINE_NS: tl.constexpr,
 ):
     feature_offsets = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
     # Expert strides can exceed 2**31 elements for full model weights.
@@ -291,7 +292,9 @@ def moe_expert_up_kernel(
         )
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
         gate_accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for channel_start in range(tl.cdiv(CHANNELS, BLOCK_K)):
+        for channel_start in tl.range(
+            tl.cdiv(CHANNELS, BLOCK_K), num_stages=PIPELINE_NS
+        ):
             channels = channel_start * BLOCK_K + channel_offsets
             hidden = tl.load(
                 Hidden + token_base[:, None] + channels[None, :] * stride_hidden_dim,
@@ -366,6 +369,7 @@ def moe_expert_down_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    PIPELINE_NS: tl.constexpr,
 ):
     channel_offsets = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
     # Expert strides can exceed 2**31 elements for full model weights.
@@ -379,7 +383,9 @@ def moe_expert_down_kernel(
             SlotRoutes + expert * CAPACITY + rows, rows < count, other=-1
         ).to(tl.int64)
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for feature_start in range(tl.cdiv(INTERMEDIATE_SIZE, BLOCK_K)):
+        for feature_start in tl.range(
+            tl.cdiv(INTERMEDIATE_SIZE, BLOCK_K), num_stages=PIPELINE_NS
+        ):
             features = feature_start * BLOCK_K + feature_offsets
             hidden = tl.load(
                 UpOutput + routes[:, None] * INTERMEDIATE_SIZE + features[None, :],
@@ -464,6 +470,20 @@ def moe_gate_combine_kernel(
         ).to(tl.float32)
         output = tl.sum(values * weights[:, None], axis=0)
     tl.store(Output + token * CHANNELS + channels, output, channels < CHANNELS)
+
+
+def _select_expert_tiling(
+    num_tokens, num_experts, top_k, channels, intermediate, dtype
+):
+    """Reuse larger expert tiles when enough routed tokens share each weight."""
+    if dtype == torch.float32 or min(channels, intermediate) < 512:
+        return 16, 32, 32, None
+    routes = num_tokens * top_k
+    if routes >= 64 * num_experts:
+        return 128, 64, 64, 3
+    if routes >= 16 * num_experts:
+        return 64, 128, 64, 3
+    return 16, 64, 64, 3
 
 
 def _expert_row_partitions(capacity, num_experts, output_tiles, block_m):
@@ -598,6 +618,14 @@ def moe_gate_top_k_routing(
             num_warps=4,
         )
         if activation != "identity":
+            block_m, block_n, block_k, pipeline_ns = _select_expert_tiling(
+                num_tokens,
+                num_experts,
+                int(top_k),
+                channels,
+                intermediate_size,
+                hidden_states.dtype,
+            )
             up_output = torch.empty(
                 (num_tokens * int(top_k), intermediate_size), **options
             )
@@ -630,7 +658,8 @@ def moe_gate_top_k_routing(
                 BLOCK_N=block_n,
                 BLOCK_K=block_k,
                 num_warps=4,
-                num_stages=2,
+                num_stages=pipeline_ns or 2,
+                PIPELINE_NS=pipeline_ns,
             )
             partial_output = up_output
             if activation != "linear":
@@ -656,7 +685,8 @@ def moe_gate_top_k_routing(
                     BLOCK_N=block_n,
                     BLOCK_K=block_k,
                     num_warps=4,
-                    num_stages=2,
+                    num_stages=pipeline_ns or 2,
+                    PIPELINE_NS=pipeline_ns,
                 )
         moe_gate_combine_kernel[(num_tokens, triton.cdiv(channels, 128))](
             router_logits,

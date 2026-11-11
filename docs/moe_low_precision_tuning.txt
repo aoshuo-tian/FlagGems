@@ -1,0 +1,122 @@
+MoE low-precision expert FFN tuning on PPU
+========================================
+
+Scope: MoE implementation, its correctness tests, and result documentation.
+The existing 20 benchmark parameter sets, registrations, input/output contract,
+capacity rules, all seven expert modes, and numerical tolerances are unchanged.
+MQA is separately tuned/refactored; see docs/mqa_low_precision_tuning.txt.
+
+Changes
+-------
+The MoE source grows from 683 to 713 lines (+30) and retains the same six
+launchable kernel definitions. No additional runtime kernel is introduced.
+Only the up/down expert kernels and their launch parameters are tuned.
+The up kernel already fuses the two gated projections and activation; this
+fusion and all existing projection/activation rounding boundaries are retained.
+
+One launch-policy helper chooses (M,N,K,pipeline stages) from routed work:
+- FP32 or min(C,F)<512: original (16,32,32), default loop pipeline.
+- Otherwise, T*K >= 64*E: (128,64,64,3).
+- Otherwise, T*K >= 16*E: (64,128,64,3).
+- Remaining low-precision model widths: (16,64,64,3).
+Here T is flattened token count, K is top_k, E is expert count.
+Larger M reuses expert weights over more tokens. Wider N/K tiles improve
+memory transfers and matrix-product utilization. Explicit tl.range stage
+annotations enable the chosen pipeline in the nested expert GEMM loops.
+Forward accumulation remains FP32 and FP32 products use ieee precision.
+Expert and route addresses retain int64 for model weights beyond 2**31 elements.
+No backend-specific intrinsics, TLE dependency, or PyTorch host compute is added.
+
+Validation
+----------
+247 correctness tests passed: original 203 plus 44 targeted cases covering
+all three tuned tiles, FP16/BF16, gated/non-gated experts, width/token tails,
+noncontiguous strides, rank-2/rank-3 inputs, empty experts, and capacity drops.
+All 60 dtype/shape paired runs passed against both references (120 comparisons).
+All returned routing logits, indices and weights were bitwise identical to
+before in all 60 runs. Numerical tolerances remain FP16 0.004, BF16 0.03,
+FP32 5e-5 (absolute and relative). Native top-k differences, if present from
+near-tie projection rounding, are recorded and checked using returned logits;
+native timing always includes its own projection. No timing uses injected logits.
+
+Measurements
+------------
+PPU-ZW810E; CUDA_VISIBLE_DEVICES isolates one GPU per process;
+PPU_FP32_TENSOR_OVERRIDE=0, OMP_NUM_THREADS=4, deterministic shape seeds.
+Before/after/padded/grouped run in one process on identical inputs.
+Timing: triton.testing.do_bench(warmup=10,rep=50,return_mode="median").
+The padded reference computes experts at fixed capacity; the grouped reference
+uses native grouped GEMM over retained routes. Both are project benchmark
+references, rather than an externally supplied acceptance benchmark.
+
+Geometric mean performance = reference latency / implementation latency.
+A mean of 0.8x corresponds to 80% of reference performance.
+Statistics below are from the complete original paired run without replacing
+any timing with isolated-control remeasurements. Arithmetic means and counts
+at or above 0.8x are also included in the accompanying CSV.
+
+all20 padded torch.float16: 1.0545x -> 2.1127x; implementation 2.003x faster
+regular11 padded torch.float16: 0.5230x -> 1.4620x; implementation 2.796x faster
+all20 padded torch.bfloat16: 0.9747x -> 1.9958x; implementation 2.048x faster
+regular11 padded torch.bfloat16: 0.5041x -> 1.4345x; implementation 2.846x faster
+all20 padded torch.float32: 2.0314x -> 2.0444x; implementation 1.006x faster
+regular11 padded torch.float32: 1.5388x -> 1.5344x; implementation 0.997x faster
+all20 grouped torch.float16: 1.3560x -> 2.7166x; implementation 2.003x faster
+regular11 grouped torch.float16: 0.7232x -> 2.0220x; implementation 2.796x faster
+all20 grouped torch.bfloat16: 1.2402x -> 2.5394x; implementation 2.048x faster
+regular11 grouped torch.bfloat16: 0.6742x -> 1.9186x; implementation 2.846x faster
+all20 grouped torch.float32: 2.1933x -> 2.2073x; implementation 1.006x faster
+regular11 grouped torch.float32: 1.7385x -> 1.7335x; implementation 0.997x faster
+
+The regular11 subset is fixed to case IDs 7,8,9,10,11,12,13,17,18,19,20.
+It includes model-width random-routing FFNs, excluding routing-only/linear
+controls, concentrated routes and the separate dropless control.
+Both FP16 and BF16 regular11 means exceed the 0.8x target on this set.
+
+Selected FP16 timings (milliseconds):
+case 8 [8, 2048, 768, 8, 3072, 1, 1.25, 2]: before=11.729100, after=2.564860, grouped=3.939080, speedup=1.5358x
+case 12 [0, 512, 2048, 60, 1408, 4, 1.25, 5]: before=2.662800, after=1.069200, grouped=3.452320, speedup=3.2289x
+case 13 [0, 8192, 2048, 60, 1408, 4, 1.25, 5]: before=32.318520, after=8.107600, grouped=11.116060, speedup=1.3711x
+case 16 [2, 2048, 2048, 60, 1408, 4, None, 5, 1]: before=16.274561, after=5.285140, grouped=5.106840, speedup=0.9663x
+case 17 [0, 32, 4096, 8, 14336, 2, 1.25, 5]: before=3.391000, after=1.824320, grouped=2.193400, speedup=1.2023x
+case 18 [0, 2048, 4096, 8, 14336, 2, 1.25, 5]: before=108.943123, after=18.285120, grouped=14.310320, speedup=0.7826x
+case 19 [4, 1024, 2048, 64, 1408, 6, 1.25, 5]: before=24.685460, after=6.468560, grouped=8.909760, speedup=1.3774x
+case 20 [8, 2048, 7168, 256, 2048, 8, 1.25, 5]: before=744.709412, after=150.427765, grouped=144.246765, speedup=0.9589x
+
+Profiler: Mixtral case 18, average GPU-kernel milliseconds per call:
+before moe_gate_projection_kernel: 0.062641 ms
+before moe_gate_select_kernel: 0.002107 ms
+before moe_gate_layout_kernel: 0.016507 ms
+before moe_expert_up_kernel: 64.253685 ms
+before moe_expert_down_kernel: 44.449520 ms
+before moe_gate_combine_kernel: 0.086827 ms
+after moe_gate_projection_kernel: 0.062653 ms
+after moe_gate_select_kernel: 0.002147 ms
+after moe_gate_layout_kernel: 0.016707 ms
+after moe_expert_up_kernel: 11.157988 ms
+after moe_expert_down_kernel: 6.929420 ms
+after moe_gate_combine_kernel: 0.086520 ms
+
+Small-control recheck
+---------------------
+The full benchmark ran while correctness JIT compilation used the other GPU.
+Two small cases showed large timing variation. After tests completed, they
+were remeasured in five alternating before/after/reference orders, with
+warmup=10 ms and rep=100 ms; the medians below are supplemental evidence.
+The full-run data above is retained unchanged.
+case 5 torch.float16: before=0.085960 ms, after=0.088100 ms, before/after=0.9757x
+case 1 torch.float32: before=0.121040 ms, after=0.121020 ms, before/after=1.0002x
+
+Remaining gaps
+--------------
+A passing mean does not imply every shape reaches 0.8x. Mixtral case 18
+remains near 0.78x of the native grouped reference despite roughly 6x
+implementation improvement. Several existing FP32 cases remain below 0.8x.
+No official acceptance dataset or aggregation rule was supplied. Results
+establish the stated mean target on the unchanged local benchmark sets.
+MetaX and other backends still require their own correctness/performance runs.
+
+Reproduce
+---------
+PPU_FP32_TENSOR_OVERRIDE=0 PYTHONPATH=src pytest -q tests/test_moe_gate_top_k_routing.py
+PPU_FP32_TENSOR_OVERRIDE=0 PYTHONPATH=src pytest -q -s benchmark/test_moe_gate_top_k_routing.py --level core --warmup 10 --iter 50 --record json --output moe_tuned.json
