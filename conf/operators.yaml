@@ -693,6 +693,13 @@ tensor into the caller-supplied `out` buffer.
   - Quantization
   stages:
   - beta: '5.3'
+- id: adaptive_attention_span
+  description: Forward causal adaptive-span attention with a decreasing distance ramp and a hard maximum span. Boolean True allows attention.
+  for: [adaptive_attention_span]
+  labels: [Attention, NoCPU]
+  kind: [NeuralNetwork]
+  stages:
+  - alpha: '5.5'
 - id: adaptive_avg_pool1d
   description: 'Applies a one-dimensional adaptive average pooling over an input signal,
 
@@ -9955,6 +9962,13 @@ primal value saved by `fw_primal` into the caller-supplied `out` buffer.
   - NeuralNetwork
   stages:
   - stable: '3.0'
+- id: group_query_attention_GQA
+  description: Forward streaming grouped-query attention. Boolean True allows attention; floating masks are additive. Fully masked rows return zero.
+  for: [group_query_attention_GQA]
+  labels: [Attention, NoCPU]
+  kind: [NeuralNetwork]
+  stages:
+  - alpha: '5.5'
 - id: grouped_matmul
   description: 'Grouped matrix multiplication on Ascend NPUs, mirroring ``torch_npu.npu_grouped_matmul``.
 
@@ -14731,6 +14745,13 @@ primal value saved by `fw_primal` into the caller-supplied `out` buffer.
   - Loss
   kind:
   - NeuralNetwork
+  stages:
+  - alpha: '5.5'
+- id: multi_query_attention_mqa
+  description: Forward multi-query attention with exactly one KV head, reusing grouped-query attention.
+  for: [multi_query_attention_mqa]
+  labels: [Attention, NoCPU]
+  kind: [NeuralNetwork]
   stages:
   - alpha: '5.5'
 - id: multilabel_margin_loss
@@ -21781,6 +21802,13 @@ primal value saved by `fw_primal` into the caller-supplied `out` buffer.
   - NeuralNetwork
   stages:
   - stable: '5.0'
+- id: swin_transformer_attention
+  description: Forward window attention with relative position bias. Boolean True blocks attention; floating masks are additive.
+  for: [swin_transformer_attention]
+  labels: [Attention, NoCPU]
+  kind: [NeuralNetwork]
+  stages:
+  - alpha: '5.5'
 - id: sym_size
   description: 'Returns the size of the input tensor as a list of integers.
 

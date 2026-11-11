@@ -1,0 +1,88 @@
+Attention operator handoff: PPU baseline for MetaX development
+============================================================
+
+Repository: https://github.com/aoshuo-tian/FlagGems
+Branch: PPU
+Base revision: 724bd4cbb21a7fdd1c7d91dc95de99e47bb602cf
+
+Status
+------
+The four forward-only operators have independent implementations and tests.
+The current code has been tested on PPU-ZW810E. MetaX validation and tuning
+are pending. The launch policies were measured on PPU; they may need changes
+for a different compiler, shared-memory budget, or register allocation.
+
+Files
+-----
+src/flag_gems/ops/group_query_attention.py
+src/flag_gems/ops/multi_query_attention.py
+src/flag_gems/ops/swin_transformer_attention.py
+src/flag_gems/ops/adaptive_attention_span.py
+tests/test_group_query_attention.py
+tests/test_multi_query_attention.py
+tests/test_swin_transformer_attention.py
+tests/test_adaptive_attention_span.py
+benchmark/test_group_query_attention.py
+benchmark/test_multi_query_attention.py
+benchmark/test_swin_transformer_attention.py
+benchmark/test_adaptive_attention_span.py
+benchmark/core_shapes.yaml
+src/flag_gems/ops/__init__.py
+conf/operators.yaml
+
+Contracts to preserve
+---------------------
+* Public entry points: group_query_attention_GQA, multi_query_attention_mqa,
+  swin_transformer_attention, adaptive_attention_span. Backward is not provided.
+* GQA/MQA: Q[B,Hq,Lq,D], K/V[B,Hkv,Lk,D]; MQA requires Hkv=1.
+  Boolean mask True allows attention; floating masks add to scores.
+* Swin: inputs are already partitioned into windows, with tokens/channels in
+  the last two dimensions. This operator computes window attention, not QKV
+  projection, window partition, or cyclic shift. Boolean mask True blocks
+  attention. Relative bias is [heads,tokens,tokens].
+* Adaptive: upper-left causal alignment, distance x=i-j, hard constraint
+  0<=x<=max_span, and weight clamp((span+ramp_length-x)/ramp_length,0,1).
+  Weights multiply unnormalized attention probabilities and are renormalized.
+  Zero weights are excluded exactly. Span is clamped to [0,max_span].
+  Boolean mask True allows attention; floating masks add to scores.
+* Fully masked rows return exact zeros. Noncontiguous tensor strides are supported.
+* FP32 dot uses IEEE precision. FP16/BF16 operands retain their dtype, with
+  FP32 softmax state and accumulation. Do not silently relax reference tolerances.
+* QK, scaling, mask/bias/span, softmax, and PV are fused. Triton tile helpers
+  are inlined. The selected short-Q/long-KV GQA/MQA path uses a partial-output
+  kernel and a stable merge kernel to expose KV parallelism.
+
+Validated PPU results
+---------------------
+The latest GQA/MQA run passed 226 correctness cases (123 GQA, 103 MQA),
+including noncontiguous inputs, odd head dimensions, fully masked rows,
+split-KV merges, and the full-tile/tail path. Independent Swin and Adaptive
+test runs previously passed 82 and 88 cases respectively.
+The latest GQA/MQA core benchmark passed 240 records: 2 operators, 2 mask
+scenarios, 3 dtypes, and 20 shapes per scenario. These are PPU results only.
+Geometric mean speedups versus local PyTorch, without a mask:
+               FP16      BF16      FP32
+GQA            0.980x    0.976x    1.007x
+MQA            0.980x    0.984x    1.028x
+
+Get the branch
+--------------
+git clone --branch PPU --single-branch https://github.com/aoshuo-tian/FlagGems.git
+cd FlagGems
+
+MetaX verification
+-------------------
+Use the existing MetaX PyTorch and Triton/FlagTree environment and follow the
+repository setup instructions for that environment. Record software versions
+and confirm FlagGems detects the MetaX backend before measuring performance.
+Run the four correctness files first, then the existing core benchmark shapes.
+Preserve the reference definitions and the same shape set during porting.
+
+MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q tests/test_group_query_attention.py tests/test_multi_query_attention.py tests/test_swin_transformer_attention.py tests/test_adaptive_attention_span.py
+
+MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q -s benchmark/test_group_query_attention.py benchmark/test_multi_query_attention.py benchmark/test_swin_transformer_attention.py benchmark/test_adaptive_attention_span.py --level core --warmup 10 --iter 50
+
+If compilation fails, retain the failing shape/dtype/strides, compiler version,
+and error first. Vendor-specific kernel changes belong under the corresponding
+runtime/backend directory, following repository conventions. Retest both masked
+and unmasked paths after changes to a shared launch policy within an operator.

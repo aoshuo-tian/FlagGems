@@ -465,6 +465,7 @@ from flag_gems.ops.absolute import absolute, absolute_
 from flag_gems.ops.acos import acos
 from flag_gems.ops.acos_ import acos_
 from flag_gems.ops.acosh import acosh, acosh_
+from flag_gems.ops.adaptive_attention_span import adaptive_attention_span
 from flag_gems.ops.adaptive_avg_pool1d import adaptive_avg_pool1d
 from flag_gems.ops.adaptive_avg_pool2d import (
     _adaptive_avg_pool2d_out as adaptive_avg_pool2d_out,
@@ -913,6 +914,7 @@ from flag_gems.ops.grid_sampler_2d_backward import grid_sampler_2d_backward
 from flag_gems.ops.grid_sampler_3d import grid_sampler_3d
 from flag_gems.ops.grid_sampler_3d_backward import grid_sampler_3d_backward
 from flag_gems.ops.group_gemm import group_mm
+from flag_gems.ops.group_query_attention import group_query_attention_GQA
 from flag_gems.ops.groupnorm import group_norm, group_norm_backward
 from flag_gems.ops.gru import gru, gru_data
 from flag_gems.ops.gru_cell import gru_cell
@@ -1192,6 +1194,7 @@ from flag_gems.ops.multi_margin_loss import (
     multi_margin_loss_backward_out,
     multi_margin_loss_out,
 )
+from flag_gems.ops.multi_query_attention import multi_query_attention_mqa
 from flag_gems.ops.multilabel_margin_loss import multilabel_margin_loss
 from flag_gems.ops.multilabel_margin_loss_forward import multilabel_margin_loss_forward
 from flag_gems.ops.multinomial import multinomial
@@ -1615,6 +1618,7 @@ from flag_gems.ops.swapaxes import swapaxes
 from flag_gems.ops.swapaxes_ import swapaxes_
 from flag_gems.ops.swapdims import swapdims
 from flag_gems.ops.swapdims_ import swapdims_
+from flag_gems.ops.swin_transformer_attention import swin_transformer_attention
 from flag_gems.ops.sym_size import sym_size, sym_size_int
 from flag_gems.ops.t_ import t_
 from flag_gems.ops.t_copy import t_copy, t_copy_out
@@ -2139,6 +2143,7 @@ __all__ = [
     "acos_",
     "acosh",
     "acosh_",
+    "adaptive_attention_span",
     "adaptive_avg_pool1d",
     "adaptive_avg_pool2d",
     "adaptive_avg_pool2d_out",
@@ -2595,6 +2600,7 @@ __all__ = [
     "group_mm",
     "group_norm",
     "group_norm_backward",
+    "group_query_attention_GQA",
     "gru",
     "gru_cell",
     "gru_data",
@@ -2907,6 +2913,7 @@ __all__ = [
     "multi_margin_loss_backward",
     "multi_margin_loss_backward_out",
     "multi_margin_loss_out",
+    "multi_query_attention_mqa",
     "multilabel_margin_loss",
     "multilabel_margin_loss_forward",
     "multinomial",
@@ -3343,6 +3350,7 @@ __all__ = [
     "swapaxes_",
     "swapdims",
     "swapdims_",
+    "swin_transformer_attention",
     "sym_size",
     "sym_size_int",
     "t_",
