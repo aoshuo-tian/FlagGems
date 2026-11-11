@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -49,12 +51,29 @@ def _torch_adaptive(query, key, value, span, max_span, ramp_length, mask=None):
 
 
 def _input(shape, dtype, device):
-    b, h, lq, lk, d = shape
+    b, h, lq, lk, d, *options = shape
     q = torch.randn(b, h, lq, d, device=device, dtype=dtype)
     k, v = [torch.randn(b, h, lk, d, device=device, dtype=dtype) for _ in range(2)]
-    maximum = lk
-    span = torch.full((h,), maximum / 2, device=device)
-    yield q, k, v, span, maximum, 32
+    maximum, span_value, ramp, layout, mask_kind = options or (lk, lk / 2, 32, 0, 0)
+    span_shape = (b, h) if layout else (h,)
+    span = (
+        torch.linspace(
+            span_value / 2, span_value, math.prod(span_shape), device=device
+        ).reshape(span_shape)
+        if options
+        else torch.full(span_shape, span_value, device=device)
+    )
+    mask = None
+    if mask_kind:
+        visible = torch.arange(lk, device=device) < max(1, lk * 3 // 4)
+        mask = (
+            visible
+            if mask_kind == 1
+            else torch.zeros(lk, device=device, dtype=dtype).masked_fill(
+                ~visible, -torch.inf
+            )
+        )
+    yield q, k, v, span, maximum, ramp, mask
 
 
 @pytest.mark.adaptive_attention_span

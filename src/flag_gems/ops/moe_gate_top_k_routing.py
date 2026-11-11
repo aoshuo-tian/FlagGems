@@ -146,9 +146,9 @@ def moe_gate_projection_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    token_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    expert_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    channel_offsets = tl.arange(0, BLOCK_K)
+    token_offsets = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+    expert_offsets = tl.program_id(1).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
+    channel_offsets = tl.arange(0, BLOCK_K).to(tl.int64)
     token_base = (
         token_offsets // SEQUENCE_LEN * stride_hidden_batch
         + token_offsets % SEQUENCE_LEN * stride_hidden_seq
@@ -190,7 +190,7 @@ def moe_gate_select_kernel(
     BLOCK_TOKENS: tl.constexpr,
     EXPERT_BLOCK: tl.constexpr,
 ):
-    tokens = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    tokens = tl.program_id(0).to(tl.int64) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     experts = tl.arange(0, EXPERT_BLOCK)
     logits = tl.load(
         RouterLogits + tokens[:, None] * NUM_EXPERTS + experts[None, :],
@@ -230,7 +230,7 @@ def moe_gate_layout_kernel(
     CAPACITY: tl.constexpr,
     BLOCK_ROUTES: tl.constexpr,
 ):
-    expert = tl.program_id(0)
+    expert = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK_ROUTES)
     for slot_start in range(tl.cdiv(CAPACITY, BLOCK_ROUTES)):
         slots = slot_start * BLOCK_ROUTES + offsets
@@ -273,14 +273,17 @@ def moe_expert_up_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    feature_offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
-    expert = tl.program_id(1)
+    feature_offsets = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Expert strides can exceed 2**31 elements for full model weights.
+    expert = tl.program_id(1).to(tl.int64)
     row_partition = tl.program_id(2)
     count = tl.load(ExpertCounts + expert)
-    channel_offsets = tl.arange(0, BLOCK_K)
+    channel_offsets = tl.arange(0, BLOCK_K).to(tl.int64)
     for row_start in range(row_partition * BLOCK_M, count, BLOCK_M * ROW_PARTITIONS):
         rows = row_start + tl.arange(0, BLOCK_M)
-        routes = tl.load(SlotRoutes + expert * CAPACITY + rows, rows < count, other=-1)
+        routes = tl.load(
+            SlotRoutes + expert * CAPACITY + rows, rows < count, other=-1
+        ).to(tl.int64)
         tokens = routes // TOP_K
         token_base = (
             tokens // SEQUENCE_LEN * stride_hidden_batch
@@ -364,14 +367,17 @@ def moe_expert_down_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    channel_offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
-    expert = tl.program_id(1)
+    channel_offsets = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Expert strides can exceed 2**31 elements for full model weights.
+    expert = tl.program_id(1).to(tl.int64)
     row_partition = tl.program_id(2)
     count = tl.load(ExpertCounts + expert)
-    feature_offsets = tl.arange(0, BLOCK_K)
+    feature_offsets = tl.arange(0, BLOCK_K).to(tl.int64)
     for row_start in range(row_partition * BLOCK_M, count, BLOCK_M * ROW_PARTITIONS):
         rows = row_start + tl.arange(0, BLOCK_M)
-        routes = tl.load(SlotRoutes + expert * CAPACITY + rows, rows < count, other=-1)
+        routes = tl.load(
+            SlotRoutes + expert * CAPACITY + rows, rows < count, other=-1
+        ).to(tl.int64)
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
         for feature_start in range(tl.cdiv(INTERMEDIATE_SIZE, BLOCK_K)):
             features = feature_start * BLOCK_K + feature_offsets
@@ -419,7 +425,7 @@ def moe_gate_combine_kernel(
     BLOCK_CHANNELS: tl.constexpr,
     IDENTITY_EXPERTS: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     channel_tile = tl.program_id(1)
     ranks = tl.arange(0, TOP_K_BLOCK)
     routes = token * TOP_K + ranks
@@ -438,7 +444,7 @@ def moe_gate_combine_kernel(
     weights = weights.to(ExpertWeights.dtype.element_ty).to(tl.float32)
     if channel_tile == 0:
         tl.store(ExpertWeights + routes, weights, ranks < TOP_K)
-    channels = channel_tile * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
+    channels = channel_tile.to(tl.int64) * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
     if IDENTITY_EXPERTS:
         token_base = (
             token // SEQUENCE_LEN * stride_hidden_batch

@@ -1,0 +1,183 @@
+Representative core shapes: 20 per operator
+===========================================
+
+Scope: MQA, Swin, Adaptive Span, and MoE only. GQA and unrelated core sections
+are byte-for-byte unchanged by this selection. This replaces the earlier
+33/41/32/61-shape candidate matrix; it does not append more cases.
+
+Each operator has exactly 20 parameter sets (80 total). MQA masked/unmasked
+and MoE padded/grouped references reuse the same respective 20 shapes.
+FP16/BF16/FP32 and alternate references expand measurements, not shape count.
+MoE has 10 rank-2 plus 10 rank-3 inputs; Swin has 10 rank-3 plus 10 rank-4.
+MQA and Adaptive Q/K/V are rank 4 by their public contracts.
+Correctness tests retain their independent boundary, stride, and error checks.
+
+Selection principles
+--------------------
+Keep realistic decode/prefill dimensions and several representative tail cases.
+Keep the largest useful stress cases; do not remove them merely for runtime.
+MoE full experts reach 16384 tokens, C=7168, E=256, F=2048, K=8;
+its largest F=14336 belongs to the separate Mixtral-size family.
+The 65536-token identity case measures routing only and is labeled accordingly.
+The largest expert weights occupy 21 GiB at FP16/BF16 or 42 GiB at FP32,
+before activations and scratch buffers. All seven expert modes remain covered.
+
+Model families borrow dimensions rather than reproduce complete models.
+Shared experts are excluded. DeepSeek-V3 dimension cases retain this operator's
+normalized top-k softmax, rather than its sigmoid/group-limited router.
+
+Parameter notation
+------------------
+MQA: [B,Hq,Hkv,Lq,Lk,D].
+Swin: [windows,WH,WW,C,H] or [B,nW,WH,WW,C,H,optional_mask_kind].
+Adaptive: [B,H,Lq,Lk,D,optional_max_span,span,ramp,span_layout,mask_kind].
+  Missing options mean max_span=Lk, span=Lk/2, ramp=32, span[H], no mask.
+  span_layout=0 means [H], 1 means [B,H]; mask_kind 0/1/2=none/bool/additive.
+MoE: [B_or_0,S,C,E,F,K,capacity_factor,activation_id,optional_route_pattern].
+  B=0 means [S,C], otherwise [B,S,C]. null capacity means no dropping.
+  Activations 0..6: identity,linear,relu,gelu,silu,swiglu,geglu.
+  Route pattern 0/default=random projection, 1=concentrated experts.
+  F is unused by identity and is C for linear.
+
+Exact selected cases
+--------------------
+
+multi_query_attention_mqa
+ 1. [4, 8, 1, 128, 128, 64]  Small prefill
+ 2. [4, 8, 1, 512, 612, 128]  Rectangular key tail
+ 3. [2, 4, 1, 2048, 2048, 32]  2K, D32
+ 4. [2, 4, 1, 1537, 2049, 64]  Odd Q/K tails
+ 5. [2, 4, 1, 4096, 4096, 16]  4K, D16
+ 6. [1, 2, 1, 8192, 8192, 32]  8K, D32
+ 7. [1, 2, 1, 512, 8202, 32]  Short Q / long KV split path
+ 8. [1, 32, 1, 1, 2048, 128]  Single-token decode, 2K cache
+ 9. [1, 32, 1, 1, 8192, 128]  Single-token decode, 8K cache
+10. [8, 32, 1, 1, 8192, 128]  Batch-8 decode
+11. [32, 32, 1, 1, 32768, 128]  Batch-32 decode, 32K cache
+12. [1, 71, 1, 1, 8192, 64]  71-head MQA decode
+13. [8, 71, 1, 16, 32768, 64]  Batched short decode, 32K cache
+14. [1, 32, 1, 128, 8192, 128]  128-query chunk
+15. [1, 32, 1, 512, 32768, 128]  512-query chunk, 32K cache
+16. [1, 32, 1, 2048, 2048, 128]  32-head 2K prefill
+17. [2, 32, 1, 4096, 4096, 128]  Batch-2 4K prefill
+18. [1, 32, 1, 8192, 8192, 128]  32-head 8K prefill
+19. [1, 64, 1, 4096, 4096, 128]  64-head 4K prefill
+20. [1, 32, 1, 2048, 2048, 256]  D256 prefill
+
+adaptive_attention_span
+ 1. [4, 8, 128, 128, 64]  Small square context
+ 2. [4, 8, 612, 512, 128]  Rectangular Q/K lengths
+ 3. [2, 4, 1024, 512, 32]  D32 / shorter K
+ 4. [2, 4, 2049, 1537, 64]  Odd sequence tails
+ 5. [2, 4, 4096, 4096, 16]  4K, D16
+ 6. [2, 4, 4096, 4000, 128]  4K unequal Q/K
+ 7. [1, 2, 8192, 8192, 32]  8K, D32
+ 8. [1, 4, 8192, 4000, 128]  8K / rectangular context
+ 9. [1, 12, 512, 512, 64, 128, 64, 32, 0, 0]  Short span
+10. [4, 12, 2048, 2048, 64, 256, 128, 32, 1, 0]  span[B,H], batch-4
+11. [1, 32, 4096, 4096, 128, 512, 256, 64, 0, 0]  32-head local span
+12. [1, 32, 8192, 8192, 128, 1024, 768, 64, 1, 0]  32-head 8K context
+13. [1, 16, 16384, 16384, 64, 2048, 1024, 128, 0, 0]  16K context
+14. [2, 16, 4096, 4096, 64, 4096, 4096, 32, 1, 0]  Full-span bound
+15. [2, 16, 4096, 4096, 64, 4096, 0, 64, 1, 0]  Zero-span boundary
+16. [2, 16, 4096, 4096, 64, 1024, 512, 32, 1, 1]  Boolean external mask
+17. [2, 16, 4096, 4096, 64, 1024, 512, 32, 1, 2]  Additive external mask
+18. [1, 16, 1024, 8192, 128, 2048, 1536, 64, 0, 0]  Short Q / long K
+19. [1, 16, 8192, 1024, 128, 1024, 512, 32, 1, 0]  Long Q / short K
+20. [4, 8, 2048, 2048, 256, 512, 320, 64, 1, 0]  D256 and per-batch span
+
+swin_transformer_attention
+ 1. [8, 4, 4, 64, 2]  Small window / launch cost
+ 2. [4, 9, 9, 64, 2]  Non-power-of-two 9x9 window
+ 3. [4, 14, 14, 128, 4]  14x14 window
+ 4. [2, 16, 32, 64, 2]  Rectangular 16x32 window
+ 5. [1, 64, 64, 32, 1]  Large-window stress
+ 6. [2048, 7, 7, 96, 3]  Many flattened 7x7 windows
+ 7. [64, 7, 7, 96, 3]  224-image stage 1
+ 8. [16, 7, 7, 192, 6]  224-image stage 2
+ 9. [4, 7, 7, 384, 12]  224-image stage 3
+10. [1, 7, 7, 768, 24]  224-image stage 4
+11. [1, 64, 7, 7, 96, 3]  Rank-4 single-image stage 1
+12. [32, 64, 7, 7, 96, 3]  Rank-4 batch-32 stage 1
+13. [8, 16, 7, 7, 192, 6]  Rank-4 batched stage 2
+14. [8, 64, 12, 12, 128, 4]  Rank-4 12x12 stage 1
+15. [8, 4, 12, 12, 512, 16]  Rank-4 12x12 stage 3
+16. [8, 1, 12, 12, 1024, 32]  Rank-4 12x12 stage 4
+17. [8, 64, 7, 7, 96, 3, 1]  7x7 bool shifted-window mask
+18. [8, 64, 7, 7, 96, 3, 2]  7x7 additive shifted-window mask
+19. [8, 16, 12, 12, 256, 8, 1]  12x12 bool shifted-window mask
+20. [8, 16, 12, 12, 256, 8, 2]  12x12 additive shifted-window mask
+
+moe_gate_top_k_routing
+ 1. [0, 16, 32, 4, 64, 1, 1.0, 2]  Small ReLU
+ 2. [0, 256, 65, 7, 129, 3, 1.0, 6]  Odd widths / GeGLU
+ 3. [2, 65, 127, 17, 193, 2, 1.25, 4]  Rank-3 odd widths / SiLU
+ 4. [4, 256, 128, 16, 256, 2, 0.5, 3]  Capacity overflow / GELU
+ 5. [0, 1024, 64, 8, 64, 2, 1.0, 1]  Linear expert
+ 6. [0, 65536, 7168, 256, 2048, 8, 1.25, 0]  65K routing-only identity
+ 7. [0, 1, 768, 8, 3072, 1, 1.25, 2]  Switch-size single-token decode
+ 8. [8, 2048, 768, 8, 3072, 1, 1.25, 2]  Switch-size rank-3 16K prefill
+ 9. [0, 1, 2048, 60, 1408, 4, 1.25, 5]  Qwen-size single-token decode
+10. [8, 1, 2048, 60, 1408, 4, 1.25, 5]  Qwen-size batch-8 decode
+11. [2, 256, 2048, 60, 1408, 4, 1.25, 5]  Qwen-size rank-3 512-token prefill
+12. [0, 512, 2048, 60, 1408, 4, 1.25, 5]  Matching 512-token rank-2 layout
+13. [0, 8192, 2048, 60, 1408, 4, 1.25, 5]  Qwen-size 8K prefill
+14. [2, 256, 2048, 60, 1408, 4, null, 5]  Dropless rank-3 routing
+15. [2, 2048, 2048, 60, 1408, 4, 1.25, 5, 1]  Concentrated routes / capacity drop
+16. [2, 2048, 2048, 60, 1408, 4, null, 5, 1]  Concentrated routes / dropless
+17. [0, 32, 4096, 8, 14336, 2, 1.25, 5]  Mixtral-size 32-token decode batch
+18. [0, 2048, 4096, 8, 14336, 2, 1.25, 5]  Mixtral-size 2K prefill
+19. [4, 1024, 2048, 64, 1408, 6, 1.25, 5]  DeepSeek-V2-Lite size, top-6
+20. [8, 2048, 7168, 256, 2048, 8, 1.25, 5]  DeepSeek-V3 dimensions, 16K prefill / int64 addresses
+
+Validation and timing
+---------------------
+PPU-ZW810E: all selected 300 dtype/scenario cases passed numerical preflight.
+They produced 360 successful reference comparisons with warmup=10 ms,
+repetition=50 ms, median timing, using triton.testing.do_bench.
+Attention uses the existing test tolerances: FP16 0.002, BF16 0.015, FP32 2e-5.
+MoE uses FP16 0.004, BF16 0.03, FP32 5e-5 (absolute and relative).
+On this PPU SDK, strict native FP32 required PPU_FP32_TENSOR_OVERRIDE=0.
+The default large-matrix tensor path differed from CPU double by about 2.9e-4;
+with that override disabled the sampled error was about 1.8e-5. The final
+measurements use the override for both implementations and keep all original
+error tolerances. This environment setting is specific to the validated PPU SDK.
+Gate logits are checked numerically; top-k IDs remain exact. When native
+rounding changes a near-tied selection, capacity/expert/combine are additionally
+checked against a reference routed from the actual returned logits. Timed
+references always compute their own gate projection; overrides are untimed.
+Per-record validation modes and near-tie counts are included in the CSV.
+The MoE int64 address fix separately passed 203 correctness tests, including
+six regressions with expert strides above 2**31 elements. Swin passed 122 cases.
+
+Geometric mean speedups, 20 parameter sets per row (native / FlagGems):
+adaptive_attention_span [native]: FP16 15.332x; BF16 15.350x; FP32 6.048x
+moe_gate_top_k_routing [grouped]: FP16 1.337x; BF16 1.290x; FP32 2.157x
+moe_gate_top_k_routing [padded]: FP16 1.009x; BF16 1.012x; FP32 2.040x
+multi_query_attention_mqa [native]: FP16 0.539x; BF16 0.538x; FP32 1.174x
+multi_query_attention_mqa_mask [native]: FP16 3.347x; BF16 3.367x; FP32 1.043x
+swin_transformer_attention [native]: FP16 3.081x; BF16 3.116x; FP32 1.589x
+
+These are PPU measurements against the stated PyTorch implementations, not
+optimized serving-engine or MetaX results. The MoE aggregate mixes expert
+modes and is not a single-model score. Use individual cases for tuning.
+The padded baseline performs extra work on unused capacity; the compact
+grouped baseline is retained for comparison. Its alignment padding is timed.
+Native grouped GEMM is optional and checked separately for each dtype/backend;
+unsupported backends report a skip. The Triton implementation does not depend
+on native grouped GEMM. No large case is filtered by elapsed time.
+
+Run the selected matrix
+-----------------------
+PPU_FP32_TENSOR_OVERRIDE=0 PYTHONPATH=src pytest -q -s benchmark/test_multi_query_attention.py benchmark/test_swin_transformer_attention.py benchmark/test_adaptive_attention_span.py benchmark/test_moe_gate_top_k_routing.py --level core --warmup 10 --iter 50 --record json --output representative20.json
+
+Dimension references
+--------------------
+https://huggingface.co/google/switch-base-8/blob/main/config.json
+https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B/blob/main/config.json
+https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/config.json
+https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json
+https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+https://huggingface.co/tiiuae/falcon-7b/blob/main/config.json
+https://github.com/microsoft/Swin-Transformer/blob/main/config.py
+https://docs.pytorch.org/docs/2.10/notes/cuda.html

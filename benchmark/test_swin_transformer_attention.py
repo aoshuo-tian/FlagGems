@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -29,20 +31,51 @@ class SwinAttentionBenchmark(base.GenericBenchmark):
 def _torch_swin(
     query, key, value, mask, num_heads, window_size, relative_position_bias
 ):
-    w, n, c = query.shape
+    n, c = query.shape[-2:]
+    w = math.prod(query.shape[:-2])
     q, k, v = [
-        t.view(w, n, num_heads, c // num_heads).transpose(1, 2)
+        t.reshape(w, n, num_heads, c // num_heads).transpose(1, 2)
         for t in (query, key, value)
     ]
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=relative_position_bias)
-    return out.transpose(1, 2).reshape(w, n, c)
+    combined = relative_position_bias
+    if mask is not None:
+        mask = mask[:, None].repeat(w // mask.shape[0], 1, 1, 1)
+        combined = combined.expand(w, num_heads, n, n)
+        combined = (
+            combined.masked_fill(mask, -torch.inf)
+            if mask.dtype == torch.bool
+            else combined + mask
+        )
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=combined)
+    return out.transpose(1, 2).reshape(query.shape)
 
 
 def _input(shape, dtype, device):
-    w, wh, ww, c, h = shape
-    q, k, v = [torch.randn(w, wh * ww, c, device=device, dtype=dtype) for _ in range(3)]
-    bias = torch.randn(h, wh * ww, wh * ww, device=device, dtype=dtype) * 0.1
-    yield q, k, v, None, h, (wh, ww), bias
+    if len(shape) == 5:
+        w, wh, ww, c, h = shape
+        token_shape = (w, wh * ww, c)
+        windows = w
+        mask_kind = 0
+    else:
+        b, windows, wh, ww, c, h, *options = shape
+        token_shape = (b, windows, wh * ww, c)
+        mask_kind = options[0] if options else 0
+    q, k, v = [torch.randn(token_shape, device=device, dtype=dtype) for _ in range(3)]
+    n = wh * ww
+    bias = torch.randn(h, n, n, device=device, dtype=dtype) * 0.1
+    mask = None
+    if mask_kind:
+        regions = torch.arange(n, device=device) // max(1, n // 4)
+        blocked = regions[:, None] != regions[None, :]
+        blocked = blocked.expand(windows, n, n)
+        mask = (
+            blocked
+            if mask_kind == 1
+            else torch.zeros((windows, n, n), device=device, dtype=dtype).masked_fill(
+                blocked, -100.0
+            )
+        )
+    yield q, k, v, mask, h, (wh, ww), bias
 
 
 @pytest.mark.swin_transformer_attention

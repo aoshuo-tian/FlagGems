@@ -91,6 +91,10 @@ def _reference(hidden, gate, top_k, capacity_factor, **kwargs):
     x = hidden.detach().cpu().double().reshape(-1, channels)
     experts = gate.shape[1]
     logits = (x @ gate.detach().cpu().double()).to(dtype).double()
+    if "router_logits" in kwargs:
+        logits = (
+            kwargs.pop("router_logits").detach().cpu().reshape(-1, experts).double()
+        )
     indices = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :top_k]
     tokens = x.shape[0]
     capacity = (
@@ -378,3 +382,69 @@ def test_moe_infers_num_experts(dtype):
         hidden, gate, top_k=2, capacity_factor=None, **kwargs
     )
     _assert_result(actual, _reference(hidden, gate, 2, None, **kwargs), hidden, 5, 2)
+
+
+@pytest.mark.moe_gate_top_k_routing
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("activation", ACTIVATIONS)
+@pytest.mark.parametrize("strided", (False, True))
+def test_moe_2d_3d_same_tokens(dtype, activation, strided):
+    hidden, gate, kwargs = _inputs((3, 17, 65), 7, 129, dtype, activation, strided)
+    flat = hidden.reshape(-1, hidden.shape[-1])
+    actual = flag_gems.moe_gate_top_k_routing(hidden, gate, 7, 3, 1.25, **kwargs)
+    flattened = flag_gems.moe_gate_top_k_routing(flat, gate, 7, 3, 1.25, **kwargs)
+    for result, expected in zip(actual, flattened):
+        torch.testing.assert_close(
+            result.reshape(expected.shape), expected, rtol=0, atol=0
+        )
+    _assert_result(actual, _reference(hidden, gate, 3, 1.25, **kwargs), hidden, 7, 3)
+
+
+@pytest.mark.moe_gate_top_k_routing
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("activation", ("relu", "swiglu"))
+def test_moe_expert_addresses_exceed_int32(dtype, activation):
+    hidden, gate, kwargs = _inputs((2, 3, 17), 2, 19, dtype, activation)
+    large_stride = 2**31 + 256
+    try:
+        for name in ("expert_up_weight", "expert_down_weight", "expert_gate_weight"):
+            if name not in kwargs:
+                continue
+            original = kwargs[name]
+            _, rows, columns = original.shape
+            weight = torch.empty_strided(
+                original.shape,
+                (large_stride, columns, 1),
+                dtype=dtype,
+                device=hidden.device,
+            )
+            weight.copy_(original)
+            kwargs[name] = weight
+    except torch.OutOfMemoryError:
+        pytest.skip(
+            "This address-width regression needs up to 24 GiB of device storage"
+        )
+    actual = flag_gems.moe_gate_top_k_routing(hidden, gate, 2, 2, None, **kwargs)
+    _assert_result(actual, _reference(hidden, gate, 2, None, **kwargs), hidden, 2, 2)
+
+
+@pytest.mark.moe_gate_top_k_routing
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_moe_routes_from_returned_quantized_logits(dtype):
+    hidden, gate, kwargs = _inputs((2, 4096, 2048), 60, 1, dtype, "identity")
+    actual = flag_gems.moe_gate_top_k_routing(hidden, gate, 60, 4, 1.25, **kwargs)
+    independent_logits = (
+        (hidden.cpu().double().reshape(-1, 2048) @ gate.cpu().double())
+        .to(dtype)
+        .reshape(actual[0].shape)
+    )
+    atol, rtol = {
+        torch.float16: (0.004, 0.004),
+        torch.bfloat16: (0.03, 0.03),
+        torch.float32: (5e-5, 5e-5),
+    }[dtype]
+    torch.testing.assert_close(
+        actual[0].cpu(), independent_logits, atol=atol, rtol=rtol
+    )
+    expected = _reference(hidden, gate, 4, 1.25, router_logits=actual[0], **kwargs)
+    _assert_result(actual, expected, hidden, 60, 4)

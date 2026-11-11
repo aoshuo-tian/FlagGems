@@ -123,7 +123,7 @@ def test_swin_reference(shape, dtype):
 @pytest.mark.parametrize("boolean", (False, True))
 @pytest.mark.parametrize("rank", (3, 4))
 def test_swin_layout_mask(dtype, boolean, rank):
-    shape = {3: (6, 49, 64), 4: (2, 3, 49, 64), 5: (2, 1, 3, 49, 64)}[rank]
+    shape = {3: (6, 49, 64), 4: (2, 3, 49, 64)}[rank]
     q, k, v = [
         torch.randn(*shape[:-1], 128, device=flag_gems.device, dtype=dtype)[..., ::2]
         for _ in range(3)
@@ -188,3 +188,27 @@ def test_swin_general_mask_broadcast(dtype, boolean, mask_shape):
         mask = torch.isneginf(mask)
     actual = flag_gems.swin_transformer_attention(query, key, value, mask, 3, 3)
     _assert_close(actual, _swin_ref(query, key, value, 3, mask))
+
+
+@pytest.mark.swin_transformer_attention
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "shape,heads,window",
+    (((2, 64, 49, 96), 3, 7), ((2, 16, 144, 256), 8, 12), ((2, 1, 49, 768), 24, 7)),
+)
+def test_swin_model_stages_and_rank_equivalence(dtype, shape, heads, window):
+    q, k, v = [
+        torch.randn(shape, device=flag_gems.device, dtype=dtype) for _ in range(3)
+    ]
+    bias = torch.randn(heads, shape[-2], shape[-2], device=q.device, dtype=dtype) * 0.1
+    actual = flag_gems.swin_transformer_attention(
+        q, k, v, num_heads=heads, window_size=window, relative_position_bias=bias
+    )
+    flat = flag_gems.swin_transformer_attention(
+        *(x.flatten(0, 1) for x in (q, k, v)),
+        num_heads=heads,
+        window_size=window,
+        relative_position_bias=bias,
+    )
+    torch.testing.assert_close(actual.flatten(0, 1), flat, rtol=0, atol=0)
+    _assert_close(actual, _swin_ref(q, k, v, heads, bias=bias))

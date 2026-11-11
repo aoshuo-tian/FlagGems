@@ -152,3 +152,10 @@ https://arxiv.org/abs/1905.07799
 https://github.com/deepspeedai/DeepSpeed/blob/master/deepspeed/moe/sharded_moe.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/switch_transformers/modeling_switch_transformers.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py
+
+Representative benchmark coverage
+---------------------------------
+The final core list contains 20 MoE parameter sets: 10 rank-2 and 10 rank-3.
+An optional ninth field selects concentrated routing (1); 0/default is random.
+Both padded and compact native baselines reuse the same 20 cases. See
+docs/operator_shape_coverage.txt for the complete selected four-operator matrix.
