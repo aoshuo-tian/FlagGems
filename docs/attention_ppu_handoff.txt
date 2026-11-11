@@ -1,88 +1,108 @@
-Attention operator handoff: PPU baseline for MetaX development
-============================================================
+Attention and MoE handoff: PPU baseline for MetaX development
+==========================================================
 
 Repository: https://github.com/aoshuo-tian/FlagGems
 Branch: PPU
-Base revision: 724bd4cbb21a7fdd1c7d91dc95de99e47bb602cf
+Upstream base revision: 724bd4cbb21a7fdd1c7d91dc95de99e47bb602cf
 
 Status
 ------
-The four forward-only operators have independent implementations and tests.
-The current code has been tested on PPU-ZW810E. MetaX validation and tuning
-are pending. The launch policies were measured on PPU; they may need changes
-for a different compiler, shared-memory budget, or register allocation.
+Five independent forward operators are implemented and validated on PPU-ZW810E.
+MetaX validation and tuning remain to be performed in the target environment.
+Backward/autograd kernels are not provided. The full interface audit, MoE expert
+formulas, overflow policy, examples, and checkpoint layout conversions are in
+docs/attention_moe_contracts.txt. That document supersedes the earlier four-op
+handoff where interface details differ.
 
 Files
 -----
-src/flag_gems/ops/group_query_attention.py
-src/flag_gems/ops/multi_query_attention.py
-src/flag_gems/ops/swin_transformer_attention.py
-src/flag_gems/ops/adaptive_attention_span.py
-tests/test_group_query_attention.py
-tests/test_multi_query_attention.py
-tests/test_swin_transformer_attention.py
-tests/test_adaptive_attention_span.py
-benchmark/test_group_query_attention.py
-benchmark/test_multi_query_attention.py
-benchmark/test_swin_transformer_attention.py
-benchmark/test_adaptive_attention_span.py
-benchmark/core_shapes.yaml
-src/flag_gems/ops/__init__.py
-conf/operators.yaml
+Each operator has its own implementation, correctness test, and benchmark:
+  group_query_attention.py
+  multi_query_attention.py
+  swin_transformer_attention.py
+  adaptive_attention_span.py
+  moe_gate_top_k_routing.py
+Implementation directory: src/flag_gems/ops/
+Correctness directory: tests/ (test_ prefix)
+Benchmark directory: benchmark/ (test_ prefix)
+Integration: src/flag_gems/ops/__init__.py, conf/operators.yaml,
+             benchmark/core_shapes.yaml
 
-Contracts to preserve
----------------------
+Attention contracts
+-------------------
 * Public entry points: group_query_attention_GQA, multi_query_attention_mqa,
-  swin_transformer_attention, adaptive_attention_span. Backward is not provided.
+  swin_transformer_attention, adaptive_attention_span.
 * GQA/MQA: Q[B,Hq,Lq,D], K/V[B,Hkv,Lk,D]; MQA requires Hkv=1.
-  Boolean mask True allows attention; floating masks add to scores.
-* Swin: inputs are already partitioned into windows, with tokens/channels in
-  the last two dimensions. This operator computes window attention, not QKV
-  projection, window partition, or cyclic shift. Boolean mask True blocks
-  attention. Relative bias is [heads,tokens,tokens].
-* Adaptive: upper-left causal alignment, distance x=i-j, hard constraint
+* GQA/MQA/Adaptive masks use ordinary right-aligned broadcasting. Boolean True
+  allows attention; floating masks add to scores. A per-batch mask must include
+  the singleton head axis, for example [B,1,Lq,Lk]. A 3D mask is per-head.
+* Swin Q/K/V are already projected and partitioned as [windows,N,C] or
+  [B,nW,N,C]. Window size accepts Ws, [Ws], or [Wh,Ww]. This operator computes
+  window attention. Boolean True blocks attention. Relative bias is [H,N,N].
+* Adaptive uses upper-left causal alignment, distance x=i-j, hard constraint
   0<=x<=max_span, and weight clamp((span+ramp_length-x)/ramp_length,0,1).
-  Weights multiply unnormalized attention probabilities and are renormalized.
-  Zero weights are excluded exactly. Span is clamped to [0,max_span].
-  Boolean mask True allows attention; floating masks add to scores.
-* Fully masked rows return exact zeros. Noncontiguous tensor strides are supported.
-* FP32 dot uses IEEE precision. FP16/BF16 operands retain their dtype, with
-  FP32 softmax state and accumulation. Do not silently relax reference tolerances.
-* QK, scaling, mask/bias/span, softmax, and PV are fused. Triton tile helpers
-  are inlined. The selected short-Q/long-KV GQA/MQA path uses a partial-output
-  kernel and a stable merge kernel to expose KV parallelism.
+  Zero weights are excluded, and the remaining probabilities are renormalized.
+  span[H] or span[B,H] is clamped to [0,max_span]; 0<=max_span<=Lk is enforced.
+* Fully masked rows return zeros. Noncontiguous tensor strides are supported.
+* FP32 dot uses IEEE precision; FP16/BF16 use FP32 softmax/accumulation.
+* QK, scaling, mask/bias/span, softmax, and PV are fused. Tile helpers are
+  inlined. Selected short-Q/long-KV GQA/MQA cases use partial and merge kernels.
+
+MoE contract
+------------
+Gate and expert weights are explicit inputs. Supported expert modes are
+identity, linear, relu, gelu, silu, swiglu, and geglu. The returned output has
+exactly hidden_states.shape and includes expert computation and weighted combine.
+expert_indices always remain in [0,E). Dropped routes have zero weights;
+surviving routes are renormalized. See the full document before integration.
 
 Validated PPU results
 ---------------------
-The latest GQA/MQA run passed 226 correctness cases (123 GQA, 103 MQA),
-including noncontiguous inputs, odd head dimensions, fully masked rows,
-split-KV merges, and the full-tile/tail path. Independent Swin and Adaptive
-test runs previously passed 82 and 88 cases respectively.
-The latest GQA/MQA core benchmark passed 240 records: 2 operators, 2 mask
-scenarios, 3 dtypes, and 20 shapes per scenario. These are PPU results only.
-Geometric mean speedups versus local PyTorch, without a mask:
-               FP16      BF16      FP32
-GQA            0.980x    0.976x    1.007x
-MQA            0.980x    0.984x    1.028x
+Final source versions are covered by passing correctness batches: GQA 153,
+MQA 133, Swin 113, Adaptive 113, MoE 152: 664 distinct parametrized cases total.
+This total describes coverage across batches, not a single combined pytest run.
+The native MoE benchmark reference also matched the independent CPU reference
+for all seven expert modes and three dtypes (21 additional comparisons).
+Targeted pre-commit checks passed for the 18 changed source/test/config files.
+
+Core benchmarks completed 420 records: 120 each for GQA/MQA (masked and
+unmasked), and 60 each for Swin, Adaptive and MoE. Each scenario has 20 shapes
+and FP16/BF16/FP32. Timings compare against the local PyTorch reference in each
+benchmark. Speedup is reference latency divided by FlagGems latency.
+Geometric means, with equal weight per shape:
+                                    FP16      BF16      FP32
+GQA without mask                    0.978x    0.975x    1.008x
+GQA with mask                       2.291x    2.324x    0.971x
+MQA without mask                    0.979x    0.987x    1.029x
+MQA with mask                       2.519x    2.544x    0.999x
+Swin                                3.226x    3.479x    1.148x
+Adaptive                            6.407x    6.416x    3.198x
+MoE (mixed expert modes)            2.395x    2.404x    1.836x
+
+These are PPU results only, not guarantees for every shape or another backend.
+Swin uses an isolated full rerun with warmup=10, iter=50; the other four use
+warmup=5, iter=20. The first Swin run had timing outliers; its raw results are
+retained in the validation archive. Adaptive now uses max_span=Lk, correcting
+earlier out-of-contract cases; those earlier timings are different workloads.
 
 Get the branch
 --------------
 git clone --branch PPU --single-branch https://github.com/aoshuo-tian/FlagGems.git
 cd FlagGems
 
+For an existing clean checkout already on PPU:
+git pull --ff-only
+
 MetaX verification
--------------------
-Use the existing MetaX PyTorch and Triton/FlagTree environment and follow the
-repository setup instructions for that environment. Record software versions
-and confirm FlagGems detects the MetaX backend before measuring performance.
-Run the four correctness files first, then the existing core benchmark shapes.
-Preserve the reference definitions and the same shape set during porting.
+------------------
+Use the configured MetaX PyTorch and Triton/FlagTree environment and follow the
+repository setup instructions. Confirm FlagGems detects the MetaX backend.
 
-MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q tests/test_group_query_attention.py tests/test_multi_query_attention.py tests/test_swin_transformer_attention.py tests/test_adaptive_attention_span.py
+MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q tests/test_group_query_attention.py tests/test_multi_query_attention.py tests/test_swin_transformer_attention.py tests/test_adaptive_attention_span.py tests/test_moe_gate_top_k_routing.py
 
-MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q -s benchmark/test_group_query_attention.py benchmark/test_multi_query_attention.py benchmark/test_swin_transformer_attention.py benchmark/test_adaptive_attention_span.py --level core --warmup 10 --iter 50
+MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q -s benchmark/test_group_query_attention.py benchmark/test_multi_query_attention.py benchmark/test_swin_transformer_attention.py benchmark/test_adaptive_attention_span.py benchmark/test_moe_gate_top_k_routing.py --level core --warmup 10 --iter 50
 
-If compilation fails, retain the failing shape/dtype/strides, compiler version,
-and error first. Vendor-specific kernel changes belong under the corresponding
-runtime/backend directory, following repository conventions. Retest both masked
-and unmasked paths after changes to a shared launch policy within an operator.
+For compilation failures, retain the shape/dtype/strides, compiler version, and
+error. Retest the same references and shape set after backend-specific changes.
+Current launch policies were measured on PPU; different compiler lowering,
+shared-memory limits or register allocation may require platform-specific tuning.

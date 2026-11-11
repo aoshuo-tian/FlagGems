@@ -42,8 +42,6 @@ def _reference(q, k, v, mask=None, scale=None):
     )
     if mask is not None:
         mask = mask.cpu()
-        if mask.ndim == 3:
-            mask = mask[:, None]
         if mask.dtype == torch.bool:
             scores.masked_fill_(~mask, -torch.inf)
         else:
@@ -88,7 +86,11 @@ def _swin_ref(q, k, v, heads, mask=None, bias=None):
         combined += bias.cpu().double()
     if mask is not None:
         mask = mask.cpu()
-        if mask.ndim == 3:
+        if mask.ndim >= 5:
+            mask = torch.broadcast_to(mask, (*shape[:-2], heads, n, n)).reshape(
+                -1, heads, n, n
+            )
+        elif mask.ndim == 3:
             mask = mask[:, None]
         if mask.ndim == 4 and mask.shape[0] != q.shape[0]:
             mask = mask.repeat(q.shape[0] // mask.shape[0], 1, 1, 1)
@@ -119,7 +121,7 @@ def test_swin_reference(shape, dtype):
 @pytest.mark.swin_transformer_attention
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("boolean", (False, True))
-@pytest.mark.parametrize("rank", (3, 4, 5))
+@pytest.mark.parametrize("rank", (3, 4))
 def test_swin_layout_mask(dtype, boolean, rank):
     shape = {3: (6, 49, 64), 4: (2, 3, 49, 64), 5: (2, 1, 3, 49, 64)}[rank]
     q, k, v = [
@@ -139,11 +141,13 @@ def test_swin_layout_mask(dtype, boolean, rank):
 
 
 @pytest.mark.swin_transformer_attention
-@pytest.mark.parametrize("case", ("heads", "window", "bias", "mask"))
+@pytest.mark.parametrize("case", ("heads", "window", "bias", "mask", "rank"))
 def test_swin_validation(case):
     q = torch.randn(2, 49, 64, device=flag_gems.device)
     kw = dict(num_heads=2, window_size=7)
-    if case == "heads":
+    if case == "rank":
+        q = q.unsqueeze(0).unsqueeze(0)
+    elif case == "heads":
         kw["num_heads"] = 3
     elif case == "window":
         kw["window_size"] = (7, 8)
@@ -153,3 +157,34 @@ def test_swin_validation(case):
         kw["mask"] = torch.zeros(3, 49, 49, device=q.device)
     with pytest.raises((ValueError, TypeError)):
         flag_gems.swin_transformer_attention(q, q, q, **kw)
+
+
+@pytest.mark.swin_transformer_attention
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("window_size", ([3], (3,), 3, (3, 3)))
+def test_swin_window_size_forms(dtype, window_size):
+    query, key, value = [
+        torch.randn(2, 9, 12, device=flag_gems.device, dtype=dtype) for _ in range(3)
+    ]
+    actual = flag_gems.swin_transformer_attention(
+        query, key, value, num_heads=3, window_size=window_size
+    )
+    _assert_close(actual, _swin_ref(query, key, value, 3))
+
+
+@pytest.mark.swin_transformer_attention
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("boolean", (False, True))
+@pytest.mark.parametrize("mask_shape", ((), (9,), (2, 3, 3, 9, 9), (1, 3, 1, 1, 9)))
+def test_swin_general_mask_broadcast(dtype, boolean, mask_shape):
+    query, key, value = [
+        torch.randn(2, 3, 9, 24, device=flag_gems.device, dtype=dtype)[..., ::2]
+        for _ in range(3)
+    ]
+    mask = torch.zeros(mask_shape, device=query.device)
+    if len(mask_shape) >= 2 and mask_shape[-2] > 2:
+        mask[..., 2, :] = -torch.inf
+    if boolean:
+        mask = torch.isneginf(mask)
+    actual = flag_gems.swin_transformer_attention(query, key, value, mask, 3, 3)
+    _assert_close(actual, _swin_ref(query, key, value, 3, mask))

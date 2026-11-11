@@ -52,7 +52,7 @@ def _input(shape, dtype, device):
     b, h, lq, lk, d = shape
     q = torch.randn(b, h, lq, d, device=device, dtype=dtype)
     k, v = [torch.randn(b, h, lk, d, device=device, dtype=dtype) for _ in range(2)]
-    maximum = max(lq, lk)
+    maximum = lk
     span = torch.full((h,), maximum / 2, device=device)
     yield q, k, v, span, maximum, 32
 

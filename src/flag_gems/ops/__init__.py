@@ -1181,6 +1181,7 @@ from flag_gems.ops.mkldnn_reorder_conv2d_weight import (
 from flag_gems.ops.mkldnn_rnn_layer import mkldnn_rnn_layer
 from flag_gems.ops.mm import mm, mm_out, router_gemm
 from flag_gems.ops.mode import mode
+from flag_gems.ops.moe_gate_top_k_routing import moe_gate_top_k_routing
 from flag_gems.ops.moveaxis import moveaxis
 from flag_gems.ops.movedim import movedim
 from flag_gems.ops.mse_loss import mse_loss
@@ -2900,6 +2901,7 @@ __all__ = [
     "mm",
     "mm_out",
     "mode",
+    "moe_gate_top_k_routing",
     "moveaxis",
     "movedim",
     "mse_loss",

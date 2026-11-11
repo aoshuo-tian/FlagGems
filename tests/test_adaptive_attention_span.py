@@ -77,8 +77,6 @@ def _reference(q, k, v, mask=None, scale=None):
     )
     if mask is not None:
         mask = mask.cpu()
-        if mask.ndim == 3:
-            mask = mask[:, None]
         if mask.dtype == torch.bool:
             scores.masked_fill_(~mask, -torch.inf)
         else:
@@ -102,8 +100,6 @@ def _adaptive_ref(q, k, v, span, maximum, ramp, mask=None):
     bias = weight.log()
     if mask is not None:
         mask = mask.cpu()
-        if mask.ndim == 3:
-            mask = mask[:, None]
         if mask.dtype == torch.bool:
             bias = bias.masked_fill(~mask, -torch.inf)
         else:
@@ -117,7 +113,7 @@ def _adaptive_ref(q, k, v, span, maximum, ramp, mask=None):
 def test_adaptive_reference(shape, dtype):
     b, h, _, lq, lk, d = shape
     q, k, v = _make((b, h, h, lq, lk, d), dtype)
-    maximum = max(lq, lk) // 2
+    maximum = min(max(lq, lk) // 2, lk)
     span = torch.linspace(0, maximum, h, device=q.device)
     out = flag_gems.adaptive_attention_span(q, k, v, span, maximum, 13.5)
     _assert_close(out, _adaptive_ref(q, k, v, span, maximum, 13.5))
@@ -126,7 +122,7 @@ def test_adaptive_reference(shape, dtype):
 @pytest.mark.adaptive_attention_span
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("boolean", (True, False))
-@pytest.mark.parametrize("maximum", (0, 7, 100))
+@pytest.mark.parametrize("maximum", (0, 7, 73))
 def test_adaptive_span_boundaries(dtype, boolean, maximum):
     q, k, v = _make((2, 4, 4, 137, 73, 33), dtype, True)
     span = torch.tensor(
@@ -155,7 +151,15 @@ def test_adaptive_distance_direction_and_causality():
 @pytest.mark.adaptive_attention_span
 @pytest.mark.parametrize(
     "case",
-    ("span_shape", "span_dtype", "ramp_zero", "ramp_nan", "max_negative", "heads"),
+    (
+        "span_shape",
+        "span_dtype",
+        "ramp_zero",
+        "ramp_nan",
+        "max_negative",
+        "max_too_large",
+        "heads",
+    ),
 )
 def test_adaptive_validation(case):
     q, k, v = _make((2, 4, 4, 7, 9, 16), torch.float32)
@@ -171,6 +175,8 @@ def test_adaptive_validation(case):
         ramp = float("nan")
     elif case == "max_negative":
         maximum = -1
+    elif case == "max_too_large":
+        maximum = k.shape[2] + 1
     elif case == "heads":
         k, v = (k[:, :2], v[:, :2])
     with pytest.raises((ValueError, TypeError)):
@@ -182,6 +188,21 @@ def test_adaptive_validation(case):
 def test_adaptive_fractional_span_tile_skipping(dtype):
     q, k, v = _make((2, 4, 4, 257, 193, 32), dtype, True)
     span = torch.tensor([0.1, 31.5, 63.25, 1000.0], device=q.device)
-    out = flag_gems.adaptive_attention_span(q, k, v, span, 256, 0.5)
-    _assert_close(out, _adaptive_ref(q, k, v, span, 256, 0.5))
+    out = flag_gems.adaptive_attention_span(q, k, v, span, 193, 0.5)
+    _assert_close(out, _adaptive_ref(q, k, v, span, 193, 0.5))
     assert torch.count_nonzero(out[:, 0, 193:, :]) == 0
+
+
+@pytest.mark.adaptive_attention_span
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mask_shape", ((), (19,), (4, 1, 19), (4, 13, 19)))
+@pytest.mark.parametrize("boolean", (False, True))
+def test_standard_mask_broadcast(dtype, mask_shape, boolean):
+    query, key, value = _make((2, 4, 4, 13, 19, 17), dtype, True)
+    mask = torch.zeros(mask_shape, device=query.device)
+    if boolean:
+        mask = mask.to(torch.bool)
+    span = torch.full((4,), 5.5, device=query.device)
+    actual = flag_gems.adaptive_attention_span(query, key, value, span, 11, 3.5, mask)
+    expected = _adaptive_ref(query, key, value, span, 11, 3.5, mask)
+    _assert_close(actual, expected)

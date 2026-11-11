@@ -43,27 +43,23 @@ def _validate_qkv_tensors(query, key, value, ndim=4):
 
 def _resolve_mask_layout(attn_mask, query, shape):
     if attn_mask is None:
-        return ((0, 0, 0, 0), 1)
+        return (0, 0, 0, 0), 1
     if not isinstance(attn_mask, torch.Tensor):
         raise TypeError("mask must be a tensor")
     if attn_mask.device != query.device:
         raise ValueError("mask must be on the query device")
     if attn_mask.dtype not in (torch.bool, *_SUPPORTED_DTYPES):
         raise TypeError("mask must have bool or floating dtype")
-    if attn_mask.ndim == 2:
-        sizes, strides = ((1, 1, *attn_mask.shape), (0, 0, *attn_mask.stride()))
-    elif attn_mask.ndim == 3:
-        sizes = (attn_mask.shape[0], 1, *attn_mask.shape[1:])
-        strides = (attn_mask.stride(0), 0, *attn_mask.stride()[1:])
-    elif attn_mask.ndim == 4:
-        sizes, strides = (tuple(attn_mask.shape), attn_mask.stride())
-    else:
-        raise ValueError("mask must have 2, 3 (batch), or 4 dimensions")
-    for axis, (size, target) in enumerate(zip(sizes, shape)):
+    if attn_mask.ndim > 4:
+        raise ValueError("mask must be broadcastable to [B,H,Lq,Lk]")
+    padding = 4 - attn_mask.ndim
+    sizes = (1,) * padding + tuple(attn_mask.shape)
+    strides = (0,) * padding + tuple(attn_mask.stride())
+    for size, target in zip(sizes, shape):
         if size not in (1, target):
             raise ValueError("mask is not broadcastable to attention scores")
     return (
-        tuple((0 if size == 1 else stride for size, stride in zip(sizes, strides))),
+        tuple(0 if size == 1 else stride for size, stride in zip(sizes, strides)),
         sizes[0],
     )
 
@@ -642,8 +638,9 @@ def group_query_attention_GQA(
     """Return forward GQA for Q[B,Hq,Lq,D], K/V[B,Hkv,Lk,D].
 
     Hq must be divisible by Hkv. Boolean True allows attention; floating masks
-    are additive. Masks support [Lq,Lk], [B,Lq,Lk], [B,Hq,Lq,Lk] with singleton
-    broadcasting. Fully masked rows return exact zero. Backward is not provided.
+    are additive. Masks use standard right-aligned broadcasting to [B,Hq,Lq,Lk].
+    A 3D mask is [Hq,Lq,Lk]; a batch mask uses [B,1,Lq,Lk].
+    Fully masked rows return exact zero. Backward is not provided.
     """
     _validate_inputs(query, key, value, mask, scale, num_query_heads, num_kv_heads)
     return _launch_attention_forward(query, key, value, mask, scale)

@@ -65,8 +65,6 @@ def _reference(q, k, v, mask=None, scale=None):
     )
     if mask is not None:
         mask = mask.cpu()
-        if mask.ndim == 3:
-            mask = mask[:, None]
         if mask.dtype == torch.bool:
             scores.masked_fill_(~mask, -torch.inf)
         else:
@@ -100,14 +98,15 @@ def test_gqa_reference(shape, dtype):
 
 @pytest.mark.group_query_attention_GQA
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("layout", ("2d", "batch", "head", "singleton"))
+@pytest.mark.parametrize("layout", ("2d", "batch", "head", "singleton", "head_3d"))
 @pytest.mark.parametrize("boolean", (True, False))
 def test_gqa_mask(dtype, layout, boolean):
     q, k, v = _make((2, 4, 2, 37, 97, 32), dtype, True)
     shape = {
         "2d": (37, 97),
-        "batch": (2, 37, 97),
+        "batch": (2, 1, 37, 97),
         "head": (2, 4, 37, 97),
+        "head_3d": (4, 37, 97),
         "singleton": (1, 4, 1, 97),
     }[layout]
     mask = torch.zeros(*shape[:-1], shape[-1] * 2, device=q.device)[..., ::2]
@@ -212,3 +211,17 @@ def test_unmasked_interior_and_tail(dtype, query_len, key_len, head_dim):
     query, key, value = _make((2, 4, 2, query_len, key_len, head_dim), dtype, True)
     actual = flag_gems.group_query_attention_GQA(query, key, value, scale=0.17)
     _assert_close(actual, _reference(query, key, value, scale=0.17))
+
+
+@pytest.mark.group_query_attention_GQA
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mask_shape", ((), (19,), (4, 1, 19), (4, 13, 19)))
+@pytest.mark.parametrize("boolean", (False, True))
+def test_standard_mask_broadcast(dtype, mask_shape, boolean):
+    query, key, value = _make((2, 4, 2, 13, 19, 17), dtype, True)
+    mask = torch.zeros(mask_shape, device=query.device)
+    if boolean:
+        mask = mask.to(torch.bool)
+    actual = flag_gems.group_query_attention_GQA(query, key, value, mask)
+    expected = _reference(query, key, value, mask)
+    _assert_close(actual, expected)

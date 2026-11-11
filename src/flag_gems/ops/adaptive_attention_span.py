@@ -43,27 +43,23 @@ def _validate_qkv_tensors(query, key, value, ndim=4):
 
 def _resolve_mask_layout(attn_mask, query, shape):
     if attn_mask is None:
-        return ((0, 0, 0, 0), 1)
+        return (0, 0, 0, 0), 1
     if not isinstance(attn_mask, torch.Tensor):
         raise TypeError("mask must be a tensor")
     if attn_mask.device != query.device:
         raise ValueError("mask must be on the query device")
     if attn_mask.dtype not in (torch.bool, *_SUPPORTED_DTYPES):
         raise TypeError("mask must have bool or floating dtype")
-    if attn_mask.ndim == 2:
-        sizes, strides = ((1, 1, *attn_mask.shape), (0, 0, *attn_mask.stride()))
-    elif attn_mask.ndim == 3:
-        sizes = (attn_mask.shape[0], 1, *attn_mask.shape[1:])
-        strides = (attn_mask.stride(0), 0, *attn_mask.stride()[1:])
-    elif attn_mask.ndim == 4:
-        sizes, strides = (tuple(attn_mask.shape), attn_mask.stride())
-    else:
-        raise ValueError("mask must have 2, 3 (batch), or 4 dimensions")
-    for axis, (size, target) in enumerate(zip(sizes, shape)):
+    if attn_mask.ndim > 4:
+        raise ValueError("mask must be broadcastable to [B,H,Lq,Lk]")
+    padding = 4 - attn_mask.ndim
+    sizes = (1,) * padding + tuple(attn_mask.shape)
+    strides = (0,) * padding + tuple(attn_mask.stride())
+    for size, target in zip(sizes, shape):
         if size not in (1, target):
             raise ValueError("mask is not broadcastable to attention scores")
     return (
-        tuple((0 if size == 1 else stride for size, stride in zip(sizes, strides))),
+        tuple(0 if size == 1 else stride for size, stride in zip(sizes, strides)),
         sizes[0],
     )
 
@@ -92,8 +88,8 @@ def _validate_inputs(query, key, value, span, max_span, ramp_length, mask=None):
         raise TypeError("span must have floating dtype")
     if isinstance(max_span, bool) or not isinstance(max_span, numbers.Integral):
         raise TypeError("max_span must be a nonnegative integer")
-    if max_span < 0:
-        raise ValueError("max_span must be nonnegative")
+    if not 0 <= max_span <= key.shape[2]:
+        raise ValueError("max_span must be between zero and the key sequence length")
     if isinstance(ramp_length, bool) or not isinstance(ramp_length, numbers.Real):
         raise TypeError("ramp_length must be a positive finite real number")
     if not math.isfinite(ramp_length) or ramp_length <= 0:
@@ -352,7 +348,7 @@ def adaptive_attention_span(query, key, value, span, max_span, ramp_length, mask
     """Forward adaptive-span attention, with upper-left causal alignment.
 
     Q[B,H,Lq,D], K/V[B,H,Lk,D]; span[H] or span[B,H] contains finite distances.
-    Span is clamped to [0,max_span]. At distance x=i-j, the multiplicative
+    max_span cannot exceed Lk. Span is clamped to [0,max_span]. At distance x=i-j, the multiplicative
     weight is clamp((span+ramp_length-x)/ramp_length,0,1); positions outside
     0 <= x <= max_span are blocked. Zero weights are exactly excluded.
     Boolean masks use True=allowed; float masks are additive. No backward.

@@ -42,32 +42,44 @@ def _validate_qkv_tensors(query, key, value, ndim=4):
 
 
 def _resolve_mask_layout(attn_mask, query, shape):
+    window_shape = tuple(query.shape[:-2])
     if attn_mask is None:
-        return ((0, 0, 0, 0), 1)
+        return (0, 0, 0, 0), 1, (0,) * len(window_shape), True
     if not isinstance(attn_mask, torch.Tensor):
         raise TypeError("mask must be a tensor")
     if attn_mask.device != query.device:
         raise ValueError("mask must be on the query device")
     if attn_mask.dtype not in (torch.bool, *_SUPPORTED_DTYPES):
         raise TypeError("mask must have bool or floating dtype")
-    if attn_mask.ndim == 2:
-        sizes, strides = ((1, 1, *attn_mask.shape), (0, 0, *attn_mask.stride()))
-    elif attn_mask.ndim == 3:
-        sizes = (attn_mask.shape[0], 1, *attn_mask.shape[1:])
-        strides = (attn_mask.stride(0), 0, *attn_mask.stride()[1:])
-    elif attn_mask.ndim == 4:
-        sizes, strides = (tuple(attn_mask.shape), attn_mask.stride())
-    else:
-        raise ValueError("mask must have 2, 3 (batch), or 4 dimensions")
-    for axis, (size, target) in enumerate(zip(sizes, shape)):
-        if axis == 0 and size > 0 and (target % size == 0):
-            continue
-        if size not in (1, target):
-            raise ValueError("mask is not broadcastable to attention scores")
-    return (
-        tuple((0 if size == 1 else stride for size, stride in zip(sizes, strides))),
-        sizes[0],
-    )
+    if attn_mask.ndim <= 4:
+        # [nW,N,N] repeats across flattened batches and is shared by all heads.
+        if attn_mask.ndim == 3:
+            sizes = (attn_mask.shape[0], 1, *attn_mask.shape[1:])
+            strides = (attn_mask.stride(0), 0, *attn_mask.stride()[1:])
+        else:
+            padding = 4 - attn_mask.ndim
+            sizes = (1,) * padding + tuple(attn_mask.shape)
+            strides = (0,) * padding + tuple(attn_mask.stride())
+        for axis, (size, target) in enumerate(zip(sizes, shape)):
+            if axis == 0 and size > 0 and target % size == 0:
+                continue
+            if size not in (1, target):
+                raise ValueError("mask is not broadcastable to window attention scores")
+        strides = tuple(
+            0 if size == 1 else stride for size, stride in zip(sizes, strides)
+        )
+        return strides, sizes[0], (0,) * len(window_shape), True
+    target = (*window_shape, *shape[1:])
+    if attn_mask.ndim > len(target):
+        raise ValueError("mask has more dimensions than window attention scores")
+    padding = len(target) - attn_mask.ndim
+    sizes = (1,) * padding + tuple(attn_mask.shape)
+    strides = (0,) * padding + tuple(attn_mask.stride())
+    for size, expected in zip(sizes, target):
+        if size not in (1, expected):
+            raise ValueError("mask is not broadcastable to window attention scores")
+    strides = tuple(0 if size == 1 else stride for size, stride in zip(sizes, strides))
+    return (0, *strides[-3:]), 1, strides[:-3], False
 
 
 def _validate_inputs(
@@ -81,8 +93,8 @@ def _validate_inputs(
 ):
     if not isinstance(query, torch.Tensor):
         raise TypeError("query must be a tensor")
-    if query.ndim < 3:
-        raise ValueError("window inputs require at least three dimensions")
+    if query.ndim not in (3, 4):
+        raise ValueError("window inputs require three or four dimensions")
     _validate_qkv_tensors(query, key, value, query.ndim)
     if key.shape != query.shape or value.shape != query.shape:
         raise ValueError("window Q/K/V shapes must match")
@@ -97,6 +109,8 @@ def _validate_inputs(
             if isinstance(window_size, numbers.Integral)
             else window_size
         )
+        if isinstance(sizes, (tuple, list)) and len(sizes) == 1:
+            sizes = (sizes[0], sizes[0])
         if not isinstance(sizes, (tuple, list)) or len(sizes) != 2:
             raise ValueError("window_size must be an integer or a pair")
         if any(
@@ -150,6 +164,8 @@ def swin_transformer_attention_fwd_kernel(
     stride_o_dim: tl.constexpr,
     mask_strides: tl.constexpr,
     MASK_BATCH: tl.constexpr,
+    mask_batch_strides: tl.constexpr,
+    MASK_BATCH_IS_FLAT: tl.constexpr,
     relative_bias_strides: tl.constexpr,
     QUERY_HEADS: tl.constexpr,
     QUERY_LEN: tl.constexpr,
@@ -174,12 +190,15 @@ def swin_transformer_attention_fwd_kernel(
     query_base = tl.full((), 0, tl.int64)
     key_base = tl.full((), 0, tl.int64)
     value_base = tl.full((), 0, tl.int64)
+    mask_base = tl.full((), 0, tl.int64)
     for batch_axis in tl.static_range(len(BATCH_SHAPE) - 1, -1, -1):
         batch_coord = batch_index % BATCH_SHAPE[batch_axis]
         batch_index = batch_index // BATCH_SHAPE[batch_axis]
         query_base += batch_coord.to(tl.int64) * batch_strides_q[batch_axis]
         key_base += batch_coord.to(tl.int64) * batch_strides_k[batch_axis]
         value_base += batch_coord.to(tl.int64) * batch_strides_v[batch_axis]
+        if HAS_MASK and not MASK_BATCH_IS_FLAT:
+            mask_base += batch_coord.to(tl.int64) * mask_batch_strides[batch_axis]
     head_offsets = tl.arange(0, HEAD_BLOCK)
     query = tl.load(
         Q
@@ -218,6 +237,7 @@ def swin_transformer_attention_fwd_kernel(
         if HAS_MASK:
             attn_mask = tl.load(
                 AttnMask
+                + mask_base
                 + batch % MASK_BATCH * mask_strides[0]
                 + query_head * mask_strides[1]
                 + query_offsets[:, None] * mask_strides[2]
@@ -305,8 +325,10 @@ def _launch_attention_forward(
     ]
     output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
     output_strides = (query_len * channels, head_dim, channels, 1)
-    mask_strides, mask_batch = _resolve_mask_layout(
-        attn_mask, query, (batch_size, query_heads, query_len, key_len)
+    mask_strides, mask_batch, mask_batch_strides, mask_batch_is_flat = (
+        _resolve_mask_layout(
+            attn_mask, query, (batch_size, query_heads, query_len, key_len)
+        )
     )
     relative_bias_strides = (
         (0, 0, 0) if relative_position_bias is None else relative_position_bias.stride()
@@ -348,6 +370,8 @@ def _launch_attention_forward(
             stride_o_dim=output_strides[3],
             mask_strides=mask_strides,
             MASK_BATCH=mask_batch,
+            mask_batch_strides=mask_batch_strides,
+            MASK_BATCH_IS_FLAT=mask_batch_is_flat,
             relative_bias_strides=relative_bias_strides,
             QUERY_HEADS=query_heads,
             QUERY_LEN=query_len,
@@ -378,11 +402,11 @@ def swin_transformer_attention(
     window_size=None,
     relative_position_bias=None,
 ):
-    """Forward attention on [..., windows, tokens, channels], without copies.
+    """Forward attention on [windows,tokens,channels] or [B,nW,tokens,channels].
 
     Boolean True blocks attention; floating masks are additive. A mask's window
     dimension may divide the flattened window count (shared across images).
-    Relative bias has shape [heads,tokens,tokens]. A scalar window_size denotes
+    Relative bias has shape [heads,tokens,tokens]. A scalar or one-element window_size denotes
     a square window; a pair specifies (height,width). Backward is not provided.
     """
     _validate_inputs(

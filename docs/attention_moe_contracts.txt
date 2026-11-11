@@ -1,0 +1,154 @@
+Five-operator contract audit and MoE usage
+=========================================
+
+Scope
+-----
+These are forward operators. Autograd/backward kernels, distributed expert
+communication, auxiliary router losses, and expert biases are not implemented.
+PPU is the validated development platform; MetaX validation is still required.
+Expert dropout is omitted; compare model integrations in evaluation mode.
+
+Attention contract audit
+-----------------------
+1. group_query_attention_GQA
+   Q[B,Hq,Lq,D], K/V[B,Hkv,Lk,D], Hq divisible by Hkv, explicit head counts
+   validated against shapes, default scale=1/sqrt(D), output matches Q shape/dtype.
+2. multi_query_attention_mqa
+   Same forward behavior with exactly one K/V head. Implementation and tests
+   are independent of GQA.
+3. swin_transformer_attention
+   Supports [windows,N,C] and [B,nW,N,C] Q/K/V, with matching shapes and
+   C divisible by num_heads. window_size accepts Ws, [Ws], (Ws,), or (Wh,Ww).
+   The area must match N. Relative position bias is [heads,N,N]. Output matches Q.
+   Q/K/V are already projected and partitioned into windows; projection, cyclic
+   shift, and window partition/reversal belong to the caller.
+4. adaptive_attention_span
+   Q[B,H,Lq,D], K/V[B,H,Lk,D], span[H] or span[B,H]. max_span is validated
+   in [0,Lk]. span values are clamped to [0,max_span]. ramp_length must be
+   positive and finite. The causal alignment is upper-left: distance=i-j.
+   Weight=clamp((span+ramp_length-distance)/ramp_length,0,1); positions with
+   distance<0, distance>max_span, or weight=0 are excluded. Output matches Q.
+
+Mask corrections from the earlier PPU baseline:
+* GQA/MQA/Adaptive use ordinary right-aligned broadcasting to [B,H,Lq,Lk],
+  including scalar, [Lk], [Lq,Lk], [H,Lq,Lk], and [B,1,Lq,Lk] masks.
+  A 3D mask means a per-head mask; a batch mask needs its explicit singleton
+  head axis. Earlier [B,Lq,Lk] examples/references were changed accordingly.
+* For these three operators, bool True means visible; floating masks are additive.
+* Swin bool True means blocked. [nW,N,N] is shared across heads and repeats
+  across flattened image batches. Scalar/1D masks and explicit broadcastable
+  [B,nW,H,N,N] masks are also supported.
+* Fully masked rows return exact zero; noncontiguous strides are supported.
+* FP32 dot retains IEEE precision. Tile helpers are inlined; split-KV paths
+  have a separate stable merge kernel when that parallelism is selected.
+
+Adaptive benchmark attribute correction:
+The earlier generator used max(Lq,Lk) for max_span, which could exceed Lk.
+It now uses Lk. The 20 Q/K/V shapes are unchanged, but old measurements made
+with an out-of-contract max_span must not be treated as the same workload.
+
+MoE interface
+-------------
+moe_gate_top_k_routing(hidden_states, gate_weight, num_experts=None,
+    top_k=1, capacity_factor=1.0, *, expert_up_weight=None,
+    expert_down_weight=None, expert_gate_weight=None, activation="relu")
+
+The original operator table omitted trainable gate/expert parameters. This
+function requires them explicitly rather than generating random weights.
+
+hidden_states: [T,C] or [B,S,C], FP16/BF16/FP32.
+gate_weight: [C,E], floating, on the same device; a FP32 router weight can be
+used with lower-precision hidden states. num_experts can be inferred from it.
+Expert weights share hidden_states dtype/device and use the layouts below.
+
+Returns exactly four tensors:
+  router_logits: [...,E], dtype=hidden_states.dtype
+  expert_weights: [...,K], dtype=hidden_states.dtype
+  expert_indices: [...,K], int64, always in [0,E)
+  output: hidden_states.shape, dtype=hidden_states.dtype
+
+Top-k is ordered by descending logit; ties use the smaller expert ID.
+Without capacity dropping, expert_weights=softmax(selected logits).
+With dropping, rejected routes get weight zero and the remaining routes are
+renormalized using a stable softmax. A token with no surviving route gets
+all-zero weights and output. The original selected expert IDs remain valid.
+
+Capacity follows the generic DeepSpeed topkgating position policy:
+  capacity=ceil(capacity_factor*T*K/E), without a separate minimum-capacity attr.
+Each expert retains tokens in input order. capacity_factor=None disables drops.
+Storage is bounded by T slots per expert, since top-k never repeats an expert
+within one token. This does not change which routes survive the capacity rule.
+This intentionally follows generic top-k behavior for all K, rather than
+DeepSpeed's separate stochastic/specialized top-1 and top-2 router branches.
+
+Expert modes (bias-free)
+-----------------------
+identity: expert(x)=x; no expert weights. This is an explicit inspection/test
+          mode, not an implicit substitute for a trained expert network.
+linear:   expert(x)=x@up[e]; up[E,C,C], no down/gate weights.
+relu:     expert(x)=ReLU(x@up[e])@down[e].
+gelu:     expert(x)=GELU(x@up[e])@down[e], using the erf GELU definition.
+silu:     expert(x)=SiLU(x@up[e])@down[e].
+swiglu:   expert(x)=(SiLU(x@gate[e])*(x@up[e]))@down[e].
+geglu:    expert(x)=(GELU(x@gate[e])*(x@up[e]))@down[e].
+The five FFN modes use up[E,C,F], down[E,F,C]. The two gated modes also
+require expert_gate_weight[E,C,F]. Projections and activation intermediates
+are rounded to hidden_states.dtype, and matrix accumulators are FP32.
+The combine step uses the actual returned expert weights and accumulates in FP32.
+
+Minimal ReLU example (replace sample tensors with trained parameters)
+--------------------------------------------------------------------
+import torch
+import flag_gems
+
+device = flag_gems.device
+dtype = torch.float16
+B, S, C, E, F, K = 2, 32, 64, 8, 128, 2
+x = torch.randn(B, S, C, device=device, dtype=dtype)
+router_weight = torch.randn(C, E, device=device, dtype=dtype) / C**0.5
+up = torch.randn(E, C, F, device=device, dtype=dtype) / C**0.5
+down = torch.randn(E, F, C, device=device, dtype=dtype) / F**0.5
+logits, weights, indices, output = flag_gems.moe_gate_top_k_routing(
+    x, router_weight, E, K, capacity_factor=1.25,
+    expert_up_weight=up, expert_down_weight=down, activation="relu")
+assert output.shape == x.shape
+
+SwiGLU example
+---------------
+expert_gate = torch.randn(E, C, F, device=device, dtype=dtype) / C**0.5
+logits, weights, indices, output = flag_gems.moe_gate_top_k_routing(
+    x, router_weight, E, K, capacity_factor=None,
+    expert_up_weight=up, expert_down_weight=down,
+    expert_gate_weight=expert_gate, activation="swiglu")
+
+Checkpoint layout notes
+-----------------------
+PyTorch nn.Linear stores [out_features,in_features], so transpose its final
+two dimensions for this API. For a Switch-style FFN, wi maps to up and wo
+maps to down. For a Mixtral-style SwiGLU expert, w1 maps to expert_gate,
+w3 maps to up, and w2 maps to down, with those transposes applied.
+Stack the expert tensors along the leading E dimension. No biases are applied.
+Recent Transformers implementations also pack gate/up weights as
+gate_up_proj[E,2*F,C]. Split this tensor along its second axis, then transpose
+the final two axes of each half. The first half supplies expert_gate_weight,
+the second half supplies expert_up_weight. Transpose down_proj[E,C,F] to [E,F,C].
+
+Run on a configured MetaX environment
+------------------------------------
+MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q tests/test_group_query_attention.py tests/test_multi_query_attention.py tests/test_swin_transformer_attention.py tests/test_adaptive_attention_span.py tests/test_moe_gate_top_k_routing.py
+
+MACA_VISIBLE_DEVICES=0 PYTHONPATH=src OMP_NUM_THREADS=4 pytest -q -s benchmark/test_moe_gate_top_k_routing.py --level core --warmup 5 --iter 20
+
+Core MoE shapes contain activation_id: 0=identity, 1=linear, 2=relu, 3=gelu,
+4=silu, 5=swiglu, 6=geglu. batch_or_zero_for_2d=0 denotes a 2D input.
+The benchmark native reference uses stable sorting, fixed-shape scatter,
+batched expert matmuls, and the same capacity/normalization contract.
+
+References used for contract review (algorithm references, not dependencies)
+---------------------------------------------------------------------------
+https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+https://github.com/pytorch/vision/blob/main/torchvision/models/swin_transformer.py
+https://arxiv.org/abs/1905.07799
+https://github.com/deepspeedai/DeepSpeed/blob/master/deepspeed/moe/sharded_moe.py
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/switch_transformers/modeling_switch_transformers.py
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py
